@@ -120,6 +120,80 @@ impl FakeGitRepositoryState {
     }
 }
 
+fn parse_head_offset(revision: &str) -> Option<usize> {
+    if revision == "HEAD" {
+        return Some(0);
+    }
+    if revision == "HEAD^" || revision == "HEAD~" {
+        return Some(1);
+    }
+    revision.strip_prefix("HEAD~")?.parse().ok()
+}
+
+fn sha_at_head_offset(state: &FakeGitRepositoryState, offset: usize) -> Option<String> {
+    if offset == 0 {
+        return state.refs.get("HEAD").cloned();
+    }
+    let index = state.commit_history.len().checked_sub(offset)?;
+    Some(state.commit_history[index].sha.clone())
+}
+
+fn resolve_revision(state: &FakeGitRepositoryState, revision: &str) -> Option<String> {
+    if let Some(sha) =
+        parse_head_offset(revision).and_then(|offset| sha_at_head_offset(state, offset))
+    {
+        return Some(sha);
+    }
+    if let Some(sha) = state.refs.get(revision) {
+        return Some(sha.clone());
+    }
+    for prefix in ["refs/heads/", "refs/tags/", "refs/remotes/"] {
+        if let Some(sha) = state.refs.get(&format!("{prefix}{revision}")) {
+            return Some(sha.clone());
+        }
+    }
+
+    let mut matches = Vec::new();
+    if let Some(head) = state.refs.get("HEAD")
+        && (head == revision || head.starts_with(revision))
+    {
+        matches.push(head.clone());
+    }
+    for snapshot in &state.commit_history {
+        if snapshot.sha == revision || snapshot.sha.starts_with(revision) {
+            matches.push(snapshot.sha.clone());
+        }
+    }
+    matches.sort();
+    matches.dedup();
+    (matches.len() == 1).then(|| matches.remove(0))
+}
+
+fn contents_at_revision(
+    state: &FakeGitRepositoryState,
+    revision: &str,
+    path: &RepoPath,
+) -> Option<Vec<u8>> {
+    match revision {
+        "" => state.index_contents.get(path).cloned(),
+        "HEAD" => state.head_contents.get(path).cloned(),
+        _ if state.refs.get("HEAD").map(String::as_str) == Some(revision) => {
+            state.head_contents.get(path).cloned()
+        }
+        _ => {
+            let sha = resolve_revision(state, revision)?;
+            if state.refs.get("HEAD").map(String::as_str) == Some(sha.as_str()) {
+                return state.head_contents.get(path).cloned();
+            }
+            state
+                .commit_history
+                .iter()
+                .find(|snapshot| snapshot.sha == sha)
+                .and_then(|snapshot| snapshot.head_contents.get(path).cloned())
+        }
+    }
+}
+
 #[derive(Clone, Default, Debug)]
 pub struct FakeBlobReadGate(Arc<Mutex<BlobReadGateState>>);
 
@@ -375,7 +449,7 @@ impl GitRepository for FakeGitRepository {
         self.with_state_async(false, |state| {
             Ok(revs
                 .into_iter()
-                .map(|rev| state.refs.get(&rev).cloned())
+                .map(|rev| resolve_revision(state, &rev))
                 .collect())
         })
     }
@@ -390,18 +464,7 @@ impl GitRepository for FakeGitRepository {
                 .map(|rev| {
                     let (prefix, path) = rev.split_once(':')?;
                     let repo_path = RepoPath::new(path).ok()?;
-                    match prefix {
-                        "" => state.index_contents.get(&repo_path).cloned(),
-                        "HEAD" => state.head_contents.get(&repo_path).cloned(),
-                        _ if state.refs.get("HEAD").map(String::as_str) == Some(prefix) => {
-                            state.head_contents.get(&repo_path).cloned()
-                        }
-                        _ => state
-                            .commit_history
-                            .iter()
-                            .find(|snapshot| snapshot.sha == prefix)
-                            .and_then(|snapshot| snapshot.head_contents.get(&repo_path).cloned()),
-                    }
+                    contents_at_revision(state, prefix, &repo_path)
                 })
                 .collect())
         });
@@ -410,23 +473,27 @@ impl GitRepository for FakeGitRepository {
 
     fn show(&self, commit: String) -> BoxFuture<'_, Result<CommitDetails>> {
         self.with_state_async(false, move |state| {
-            let sha = match state.refs.get(&commit) {
-                Some(sha) => sha.clone(),
-                // Real git fails to show an unresolvable revision (e.g. HEAD on an
-                // unborn branch), so only fall back to treating the input as a sha.
-                None => {
-                    anyhow::ensure!(
-                        commit.parse::<Oid>().is_ok(),
-                        "unable to resolve revision: {commit}"
-                    );
-                    commit
-                }
-            };
+            let sha = resolve_revision(state, &commit)
+                .or_else(|| commit.parse::<Oid>().ok().map(|_| commit.clone()))
+                .with_context(|| format!("unable to resolve revision: {commit}"))?;
             Ok(CommitDetails {
                 sha: sha.into(),
                 message: "initial commit".into(),
                 ..Default::default()
             })
+        })
+    }
+
+    fn tags(&self) -> BoxFuture<'_, Result<Vec<String>>> {
+        self.with_state_async(false, |state| {
+            let mut tags = state
+                .refs
+                .keys()
+                .filter_map(|ref_name| ref_name.strip_prefix("refs/tags/"))
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            tags.sort();
+            Ok(tags)
         })
     }
 

@@ -136,6 +136,8 @@ actions!(
         OpenModifiedFiles,
         /// Opens the current file in a solo diff view.
         OpenFileDiff,
+        /// Opens a diff of the current file against a git revision, branch, or tag.
+        CompareFileWithRevision,
         /// Clones a repository.
         Clone,
         ViewCommit,

@@ -42,6 +42,7 @@ mod commit_context_menu;
 mod commit_modal;
 pub mod commit_tooltip;
 pub mod commit_view;
+mod compare_file_with_revision;
 mod conflict_view;
 mod diff_multibuffer;
 pub mod git_graph;
@@ -112,6 +113,7 @@ pub fn init(cx: &mut App) {
         staged_diff::StagedDiff::register(workspace, cx);
         unstaged_diff::UnstagedDiff::register(workspace, cx);
         branch_diff::BranchDiff::register(workspace, cx);
+        compare_file_with_revision::register(workspace);
         CommitModal::register(workspace);
         git_panel::register(workspace);
         repository_selector::register(workspace);

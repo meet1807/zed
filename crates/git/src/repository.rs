@@ -853,6 +853,10 @@ pub trait GitRepository: Send + Sync {
 
     fn branches(&self) -> BoxFuture<'_, Result<BranchesScanResult>>;
 
+    fn tags(&self) -> BoxFuture<'_, Result<Vec<String>>> {
+        async { Ok(Vec::new()) }.boxed()
+    }
+
     fn change_branch(&self, name: String) -> BoxFuture<'_, Result<()>>;
     fn create_branch(&self, name: String, base_branch: Option<String>)
     -> BoxFuture<'_, Result<()>>;
@@ -2160,6 +2164,28 @@ impl GitRepository for RealGitRepository {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     anyhow::bail!("git stash list failed: {stderr}");
                 }
+            })
+            .boxed()
+    }
+
+    fn tags(&self) -> BoxFuture<'_, Result<Vec<String>>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let output = git
+                    .build_command(&["for-each-ref", "--format=%(refname:short)", "refs/tags"])
+                    .output()
+                    .await?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "'git for-each-ref' failed with error {:?}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                Ok(String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect())
             })
             .boxed()
     }

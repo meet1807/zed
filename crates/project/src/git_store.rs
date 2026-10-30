@@ -9175,6 +9175,17 @@ impl Repository {
         })
     }
 
+    pub fn tags(&mut self) -> oneshot::Receiver<Result<Vec<String>>> {
+        self.send_job("tags", None, move |repo, _| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.tags().await
+                }
+                RepositoryState::Remote(_) => Ok(Vec::new()),
+            }
+        })
+    }
+
     pub fn branches(&mut self) -> oneshot::Receiver<Result<BranchesScanResult>> {
         let id = self.id;
         self.send_job("branches", None, move |repo, _| async move {
@@ -10227,6 +10238,37 @@ impl Repository {
                         .await?;
                     Ok(response.staged_text)
                 }
+            }
+        });
+        cx.spawn(|_: &mut AsyncApp| async move { rx.await? })
+    }
+
+    pub fn load_text_at_revision(
+        &mut self,
+        path: RepoPath,
+        revision: String,
+        cx: &App,
+    ) -> Task<Result<Option<String>>> {
+        if revision.contains('\n') || revision.contains(':') {
+            return Task::ready(Err(anyhow!(
+                "invalid revision {revision:?}: revisions cannot contain ':' or newlines"
+            )));
+        }
+        let rx = self.send_job("load_text_at_revision", None, move |state, _| async move {
+            match state {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    let spec = format!("{revision}:{}", path.as_unix_str());
+                    let content = backend
+                        .load_revisions(vec![spec])
+                        .await?
+                        .into_iter()
+                        .next()
+                        .flatten();
+                    content.map(decode_git_text).transpose()
+                }
+                RepositoryState::Remote(_) => Err(anyhow!(
+                    "Compare file with revision is not supported for remote projects"
+                )),
             }
         });
         cx.spawn(|_: &mut AsyncApp| async move { rx.await? })
