@@ -325,6 +325,16 @@ pub fn deploy_context_menu(
                     !has_git_repo,
                     "View File History",
                     Box::new(git::FileHistory),
+                )
+                .action_disabled_when(
+                    !has_git_repo,
+                    "Compare with Revision",
+                    Box::new(git::CompareFileWithRevision),
+                )
+                .action_disabled_when(
+                    !has_git_repo,
+                    "Compare with Branch or Tag",
+                    Box::new(git::CompareFileWithBranchOrTag),
                 );
             match focus {
                 Some(focus) => builder.context(focus),

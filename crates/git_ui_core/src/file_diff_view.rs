@@ -110,13 +110,14 @@ impl FileDiffView {
         cx: &mut App,
     ) -> Task<Result<Entity<Self>>> {
         window.spawn(cx, async move |cx| {
-            Self::open_from_buffers_in(old_buffer, new_buffer, workspace, cx).await
+            Self::open_from_buffers_in(old_buffer, new_buffer, None, workspace, cx).await
         })
     }
 
     pub async fn open_from_buffers_in(
         old_buffer: Entity<Buffer>,
         new_buffer: Entity<Buffer>,
+        target_position: Option<Point>,
         workspace: WeakEntity<Workspace>,
         cx: &mut AsyncWindowContext,
     ) -> Result<Entity<Self>> {
@@ -139,6 +140,22 @@ impl FileDiffView {
             pane.update(cx, |pane, cx| {
                 pane.add_item(Box::new(diff_view.clone()), true, true, None, window, cx);
             });
+            if let Some(target_position) = target_position {
+                let (new_buffer, rhs_editor) = {
+                    let diff_view = diff_view.read(cx);
+                    (
+                        diff_view.new_buffer.clone(),
+                        diff_view.editor.read(cx).rhs_editor().clone(),
+                    )
+                };
+                let point = new_buffer
+                    .read(cx)
+                    .snapshot()
+                    .point_from_external_input(target_position.row, target_position.column);
+                rhs_editor.update(cx, |editor, cx| {
+                    editor.go_to_singleton_buffer_point(point, window, cx);
+                });
+            }
             diff_view
         })
     }

@@ -2555,6 +2555,21 @@ impl FakeFs {
         .unwrap();
     }
 
+    pub fn set_follow_aliases_for_repo(
+        &self,
+        dot_git: &Path,
+        path: &str,
+        aliases: &[&str],
+    ) {
+        self.with_git_state(dot_git, true, |state| {
+            state.follow_aliases.insert(
+                repo_path(path),
+                aliases.iter().map(|alias| repo_path(alias)).collect(),
+            );
+        })
+        .unwrap();
+    }
+
     pub fn push_commit_history_for_repo(
         &self,
         dot_git: &Path,

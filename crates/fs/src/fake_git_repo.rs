@@ -13,7 +13,8 @@ use git::{
     blame::Blame,
     repository::{
         AskPassDelegate, Branch, CommitData, CommitDataReader, CommitDetails, CommitOptions,
-        CreateWorktreeTarget, FetchOptions, FileHistoryChangedFileSets, GRAPH_CHUNK_SIZE,
+        CreateWorktreeTarget, FetchOptions, FileHistoryChangedFileSets, FileRevisionEntry,
+        GRAPH_CHUNK_SIZE,
         GitRepository, InitialGraphCommitData, LogOrder, LogSource, PushOptions, RefEdit, Remote,
         RepoPath, ResetMode, SearchCommitArgs, Worktree, commit_hash_search_query,
     },
@@ -79,6 +80,7 @@ pub struct FakeGitRepositoryState {
     pub branches_requiring_force_delete: HashSet<String>,
     pub worktrees_requiring_force_delete: HashSet<PathBuf>,
     pub refs: HashMap<String, String>,
+    pub follow_aliases: HashMap<RepoPath, Vec<RepoPath>>,
     pub graph_commits: Vec<Arc<InitialGraphCommitData>>,
     pub commit_data: HashMap<Oid, FakeCommitDataEntry>,
     pub stash_entries: GitStash,
@@ -107,6 +109,7 @@ impl FakeGitRepositoryState {
             branches_requiring_force_delete: Default::default(),
             worktrees_requiring_force_delete: Default::default(),
             refs: HashMap::from_iter([("HEAD".into(), "abc".into())]),
+            follow_aliases: Default::default(),
             merge_base_contents: Default::default(),
             oids: Default::default(),
             remotes: HashMap::default(),
@@ -494,6 +497,78 @@ impl GitRepository for FakeGitRepository {
                 .collect::<Vec<_>>();
             tags.sort();
             Ok(tags)
+        })
+    }
+
+    fn log_for_path(
+        &self,
+        path: RepoPath,
+        skip: usize,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<FileRevisionEntry>>> {
+        self.with_state_async(false, move |state| {
+            let aliases = state
+                .follow_aliases
+                .get(&path)
+                .cloned()
+                .unwrap_or_else(|| vec![path.clone()]);
+            let mut entries = Vec::new();
+            for snapshot in state.commit_history.iter().rev() {
+                if aliases
+                    .iter()
+                    .any(|alias| snapshot.head_contents.contains_key(alias))
+                {
+                    entries.push(FileRevisionEntry {
+                        sha: snapshot.sha.clone(),
+                        subject: snapshot.sha.clone(),
+                        author_name: "tester".into(),
+                        author_when: "now".into(),
+                    });
+                }
+            }
+            Ok(entries.into_iter().skip(skip).take(limit).collect())
+        })
+    }
+
+    fn historical_paths(&self, path: RepoPath) -> BoxFuture<'_, Result<Vec<RepoPath>>> {
+        self.with_state_async(false, move |state| {
+            Ok(state
+                .follow_aliases
+                .get(&path)
+                .cloned()
+                .unwrap_or_else(|| vec![path]))
+        })
+    }
+
+    fn changed_paths_at(&self, revision: String) -> BoxFuture<'_, Result<Vec<RepoPath>>> {
+        self.with_state_async(false, move |state| {
+            if let Some(rest) = revision.strip_prefix("stash@{")
+                && let Some(index_str) = rest.strip_suffix('}')
+                && let Ok(index) = index_str.parse::<usize>()
+                && let Some(entry) = state
+                    .stash_entries
+                    .entries
+                    .iter()
+                    .find(|entry| entry.index == index)
+            {
+                let oid = entry.oid.to_string();
+                if let Some(snapshot) = state
+                    .commit_history
+                    .iter()
+                    .find(|snapshot| snapshot.sha == oid)
+                {
+                    return Ok(snapshot.head_contents.keys().cloned().collect());
+                }
+            }
+            if let Some(sha) = resolve_revision(state, &revision)
+                && let Some(snapshot) = state
+                    .commit_history
+                    .iter()
+                    .find(|snapshot| snapshot.sha == sha)
+            {
+                return Ok(snapshot.head_contents.keys().cloned().collect());
+            }
+            Ok(Vec::new())
         })
     }
 

@@ -528,6 +528,14 @@ pub struct CommitDetails {
     pub author_name: SharedString,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileRevisionEntry {
+    pub sha: String,
+    pub subject: String,
+    pub author_name: String,
+    pub author_when: String,
+}
+
 #[derive(Debug)]
 pub struct CommitDiff {
     pub files: Vec<CommitFile>,
@@ -854,6 +862,23 @@ pub trait GitRepository: Send + Sync {
     fn branches(&self) -> BoxFuture<'_, Result<BranchesScanResult>>;
 
     fn tags(&self) -> BoxFuture<'_, Result<Vec<String>>> {
+        async { Ok(Vec::new()) }.boxed()
+    }
+
+    fn log_for_path(
+        &self,
+        _path: RepoPath,
+        _skip: usize,
+        _limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<FileRevisionEntry>>> {
+        async { Ok(Vec::new()) }.boxed()
+    }
+
+    fn historical_paths(&self, path: RepoPath) -> BoxFuture<'_, Result<Vec<RepoPath>>> {
+        async move { Ok(vec![path]) }.boxed()
+    }
+
+    fn changed_paths_at(&self, _revision: String) -> BoxFuture<'_, Result<Vec<RepoPath>>> {
         async { Ok(Vec::new()) }.boxed()
     }
 
@@ -2186,6 +2211,145 @@ impl GitRepository for RealGitRepository {
                     .filter(|line| !line.is_empty())
                     .map(str::to_string)
                     .collect())
+            })
+            .boxed()
+    }
+
+    fn log_for_path(
+        &self,
+        path: RepoPath,
+        skip: usize,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<FileRevisionEntry>>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let skip_arg = format!("--skip={skip}");
+                let limit_arg = format!("--max-count={limit}");
+                let output = git
+                    .build_command(&[
+                        "log",
+                        "--follow",
+                        "--format=%H%x00%s%x00%an%x00%ar",
+                        &skip_arg,
+                        &limit_arg,
+                        "--",
+                        path.as_unix_str(),
+                    ])
+                    .output()
+                    .await?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "'git log --follow' failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                Ok(String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter_map(|line| {
+                        let mut fields = line.split('\0');
+                        Some(FileRevisionEntry {
+                            sha: fields.next()?.to_string(),
+                            subject: fields.next()?.to_string(),
+                            author_name: fields.next()?.to_string(),
+                            author_when: fields.next()?.to_string(),
+                        })
+                    })
+                    .collect())
+            })
+            .boxed()
+    }
+
+    fn historical_paths(&self, path: RepoPath) -> BoxFuture<'_, Result<Vec<RepoPath>>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let output = git
+                    .build_command(&[
+                        "log",
+                        "--follow",
+                        "--name-only",
+                        "--pretty=format:",
+                        "--",
+                        path.as_unix_str(),
+                    ])
+                    .output()
+                    .await?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "'git log --follow --name-only' failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let mut paths = Vec::new();
+                paths.push(path);
+                for line in String::from_utf8_lossy(&output.stdout).lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Ok(repo_path) = RepoPath::new(line)
+                        && !paths.contains(&repo_path)
+                    {
+                        paths.push(repo_path);
+                    }
+                }
+                Ok(paths)
+            })
+            .boxed()
+    }
+
+    fn changed_paths_at(&self, revision: String) -> BoxFuture<'_, Result<Vec<RepoPath>>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let parse_paths = |stdout: &[u8]| {
+                    String::from_utf8_lossy(stdout)
+                        .lines()
+                        .filter_map(|line| RepoPath::new(line.trim()).ok())
+                        .collect::<Vec<_>>()
+                };
+                if revision.starts_with("stash@{") {
+                    let with_untracked = git
+                        .build_command(&[
+                            "stash",
+                            "show",
+                            "--name-only",
+                            "--include-untracked",
+                            "--",
+                            &revision,
+                        ])
+                        .output()
+                        .await?;
+                    if with_untracked.status.success() {
+                        return Ok(parse_paths(&with_untracked.stdout));
+                    }
+                    let tracked = git
+                        .build_command(&["stash", "show", "--name-only", "--", &revision])
+                        .output()
+                        .await?;
+                    anyhow::ensure!(
+                        tracked.status.success(),
+                        "'git stash show' failed: {}",
+                        String::from_utf8_lossy(&tracked.stderr)
+                    );
+                    return Ok(parse_paths(&tracked.stdout));
+                }
+                let output = git
+                    .build_command(&[
+                        "diff-tree",
+                        "--no-commit-id",
+                        "--name-only",
+                        "-r",
+                        &revision,
+                        "--",
+                    ])
+                    .output()
+                    .await?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "'git diff-tree' failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                Ok(parse_paths(&output.stdout))
             })
             .boxed()
     }

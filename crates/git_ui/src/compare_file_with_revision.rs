@@ -3,13 +3,15 @@ use anyhow::{Context as _, Result};
 use editor::Editor;
 use futures::channel::oneshot;
 use fuzzy::{StringMatch, StringMatchCandidate};
-use git::repository::{Branch, RepoPath};
+use git::repository::{Branch, FileRevisionEntry, RepoPath};
+use git::stash::StashEntry;
 use git_ui_core::file_diff_view::FileDiffView;
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     ParentElement, Render, SharedString, Subscription, Task, WeakEntity, Window, rems,
 };
-use language::Buffer;
+use language::{Buffer, Point};
+use multi_buffer::ToPoint as _;
 use picker::{Picker, PickerDelegate};
 use project::git_store::Repository;
 use std::sync::Arc;
@@ -17,13 +19,34 @@ use ui::{HighlightedLabel, ListItem, ListItemSpacing, prelude::*};
 use util::{ResultExt as _, paths::PathStyle};
 use workspace::{ModalView, Workspace, notifications::NotifyTaskExt};
 
+const HISTORY_PAGE_SIZE: usize = 20;
+
 pub fn register(workspace: &mut Workspace) {
     workspace.register_action(compare_file_with_revision);
+    workspace.register_action(compare_file_with_branch_or_tag);
 }
 
 fn compare_file_with_revision(
     workspace: &mut Workspace,
     _: &git::CompareFileWithRevision,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    start_compare(workspace, ComparePickerKind::History, window, cx);
+}
+
+fn compare_file_with_branch_or_tag(
+    workspace: &mut Workspace,
+    _: &git::CompareFileWithBranchOrTag,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    start_compare(workspace, ComparePickerKind::Branches, window, cx);
+}
+
+fn start_compare(
+    workspace: &mut Workspace,
+    kind: ComparePickerKind,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
@@ -33,9 +56,11 @@ fn compare_file_with_revision(
 
     let workspace_handle = workspace.weak_handle();
     let repository = target.repository.clone();
+    let repo_path = target.repo_path.clone();
     window
         .spawn(cx, async move |cx| {
-            let Some(revision) = pick_revision(repository, workspace_handle.clone(), cx).await
+            let Some(revision) =
+                pick_source(kind, repository, repo_path, workspace_handle.clone(), cx).await
             else {
                 return Ok(());
             };
@@ -50,16 +75,34 @@ fn compare_file_with_revision(
         .detach();
 }
 
+#[derive(Clone, Copy)]
+enum ComparePickerKind {
+    History,
+    Branches,
+    Stashes,
+}
+
+#[derive(Clone, Debug)]
+enum CompareChoice {
+    Revision(String),
+    Branches,
+    Stashes,
+}
+
 #[derive(Clone)]
 struct CompareTarget {
     buffer: Entity<Buffer>,
     repository: Entity<Repository>,
     repo_path: RepoPath,
+    cursor: Point,
 }
 
 fn compare_target(workspace: &Workspace, cx: &App) -> Option<CompareTarget> {
     let editor = workspace.active_item_as::<Editor>(cx)?;
-    let buffer = editor.read(cx).active_buffer(cx)?;
+    let editor = editor.read(cx);
+    let buffer = editor.active_buffer(cx)?;
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let cursor = editor.selections.newest_anchor().head().to_point(&snapshot);
     let buffer_id = buffer.read(cx).remote_id();
     let (repository, repo_path) = workspace
         .project()
@@ -71,6 +114,66 @@ fn compare_target(workspace: &Workspace, cx: &App) -> Option<CompareTarget> {
         buffer,
         repository,
         repo_path,
+        cursor,
+    })
+}
+
+fn pick_source(
+    kind: ComparePickerKind,
+    repository: Entity<Repository>,
+    repo_path: RepoPath,
+    workspace: WeakEntity<Workspace>,
+    cx: &mut gpui::AsyncWindowContext,
+) -> Task<Option<String>> {
+    cx.spawn(async move |cx| {
+        let mut kind = kind;
+        loop {
+            let choice = match kind {
+                ComparePickerKind::History => {
+                    pick_history(repository.clone(), repo_path.clone(), workspace.clone(), cx)
+                        .await?
+                }
+                ComparePickerKind::Branches => {
+                    pick_revision(repository.clone(), workspace.clone(), cx).await?
+                }
+                ComparePickerKind::Stashes => {
+                    pick_stash(repository.clone(), repo_path.clone(), workspace.clone(), cx)
+                        .await?
+                }
+            };
+            match choice {
+                CompareChoice::Revision(revision) => return Some(revision),
+                CompareChoice::Branches => kind = ComparePickerKind::Branches,
+                CompareChoice::Stashes => kind = ComparePickerKind::Stashes,
+            }
+        }
+    })
+}
+
+fn pick_history(
+    repository: Entity<Repository>,
+    repo_path: RepoPath,
+    workspace: WeakEntity<Workspace>,
+    cx: &mut gpui::AsyncWindowContext,
+) -> Task<Option<CompareChoice>> {
+    cx.spawn(async move |cx| {
+        let (tx, rx) = oneshot::channel();
+        let entries = repository
+            .update(cx, |repository, _| {
+                repository.log_for_path(repo_path.clone(), 0, HISTORY_PAGE_SIZE)
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    HistoryPicker::new(repository, repo_path, entries, tx, window, cx)
+                });
+            })
+            .ok()?;
+        rx.await.ok()
     })
 }
 
@@ -78,18 +181,16 @@ fn pick_revision(
     repository: Entity<Repository>,
     workspace: WeakEntity<Workspace>,
     cx: &mut gpui::AsyncWindowContext,
-) -> Task<Option<String>> {
+) -> Task<Option<CompareChoice>> {
     cx.spawn(async move |cx| {
         let (tx, rx) = oneshot::channel();
-        let branches = repository
-            .read_with(cx, |repository, _| repository.branch_list.clone());
+        let branches = repository.read_with(cx, |repository, _| repository.branch_list.clone());
         let tags = repository
             .update(cx, |repository, _| repository.tags())
             .await
             .ok()
             .and_then(Result::ok)
             .unwrap_or_default();
-
         workspace
             .update_in(cx, |workspace, window, cx| {
                 workspace.toggle_modal(window, cx, |window, cx| {
@@ -97,9 +198,61 @@ fn pick_revision(
                 });
             })
             .ok()?;
-
         rx.await.ok()
     })
+}
+
+fn pick_stash(
+    repository: Entity<Repository>,
+    repo_path: RepoPath,
+    workspace: WeakEntity<Workspace>,
+    cx: &mut gpui::AsyncWindowContext,
+) -> Task<Option<CompareChoice>> {
+    cx.spawn(async move |cx| {
+        let (tx, rx) = oneshot::channel();
+        let historical = repository
+            .update(cx, |repository, _| repository.historical_paths(repo_path))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+        let stash_entries = repository.read_with(cx, |repository, _| {
+            repository.cached_stash().entries
+        });
+        let mut matching = Vec::new();
+        for entry in stash_entries.iter() {
+            let revision = format!("stash@{{{}}}", entry.index);
+            let paths = repository
+                .update(cx, |repository, _| repository.changed_paths_at(revision))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default();
+            if paths.iter().any(|path| historical.contains(path)) {
+                matching.push(entry.clone());
+            }
+        }
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    StashRevisionPicker::new(matching, tx, window, cx)
+                });
+            })
+            .ok()?;
+        rx.await.ok()
+    })
+}
+
+fn short_revision(revision: &str, resolved_sha: &str) -> String {
+    let looks_like_sha = revision.len() >= 7
+        && revision
+            .chars()
+            .all(|character| character.is_ascii_hexdigit());
+    if looks_like_sha {
+        resolved_sha.chars().take(7).collect()
+    } else {
+        revision.to_string()
+    }
 }
 
 fn open_file_diff_against_revision(
@@ -110,63 +263,356 @@ fn open_file_diff_against_revision(
     cx: &mut Context<Workspace>,
 ) -> Task<Result<Entity<FileDiffView>>> {
     let workspace_handle = workspace.weak_handle();
+    let cursor = target.cursor;
     window.spawn(cx, async move |cx| {
         let revision = revision.trim().to_string();
         anyhow::ensure!(!revision.is_empty(), "revision cannot be empty");
 
-        let show_result = target
+        let details = target
             .repository
             .update(cx, |repository, _| repository.show(revision.clone()));
-        show_result
+        let details = details
             .await
             .context("failed to resolve revision")?
             .with_context(|| format!("unknown git revision '{revision}'"))?;
+        let short_ref = short_revision(&revision, details.sha.as_ref());
 
-        let content = target
+        let loaded = target
             .repository
             .update(cx, |repository, cx| {
-                repository.load_text_at_revision(target.repo_path.clone(), revision.clone(), cx)
+                repository.load_file_at_revision(
+                    target.repo_path.clone(),
+                    revision.clone(),
+                    true,
+                    cx,
+                )
             })
-            .await?
-            .with_context(|| {
-                format!(
-                    "'{}' does not exist at revision '{revision}'",
-                    target.repo_path.display(PathStyle::local())
-                )
-            })?;
+            .await?;
 
-        let (language_registry, worktree_id) =
-            workspace_handle.read_with(cx, |workspace, cx| {
-                let project = workspace.project().read(cx);
-                (
-                    project.languages().clone(),
-                    worktree_id_for_repo_path(
-                        target.repository.read(cx),
-                        project,
-                        &target.repo_path,
-                        cx,
-                    ),
-                )
-            })?;
+        let (loaded_path, content, missing) = match loaded {
+            Some((path, content)) => (path, content, false),
+            None => (target.repo_path.clone(), String::new(), true),
+        };
+
+        let (language_registry, worktree_id) = workspace_handle.read_with(cx, |workspace, cx| {
+            let project = workspace.project().read(cx);
+            (
+                project.languages().clone(),
+                worktree_id_for_repo_path(
+                    target.repository.read(cx),
+                    project,
+                    &loaded_path,
+                    cx,
+                ),
+            )
+        })?;
         let worktree_id = worktree_id.context("project has no worktrees")?;
 
-        let file_name = target
-            .repo_path
+        let file_name = loaded_path
             .file_name()
             .map(|name| name.to_string())
-            .unwrap_or_else(|| target.repo_path.display(PathStyle::local()).to_string());
-        let display_name = format!("{file_name} @ {revision}");
+            .unwrap_or_else(|| loaded_path.display(PathStyle::local()).to_string());
+        let display_name = if missing {
+            format!("{file_name} (not in {short_ref})")
+        } else {
+            format!("{file_name} ({short_ref})")
+        };
         let file = Arc::new(GitBlob {
-            path: target.repo_path.clone(),
+            path: loaded_path,
             worktree_id,
-            is_deleted: false,
+            is_deleted: missing,
             is_binary: false,
             display_name,
         }) as Arc<dyn language::File>;
 
         let old_buffer = build_buffer(content, file, &language_registry, cx).await?;
-        FileDiffView::open_from_buffers_in(old_buffer, target.buffer, workspace_handle, cx).await
+        FileDiffView::open_from_buffers_in(
+            old_buffer,
+            target.buffer,
+            Some(cursor),
+            workspace_handle,
+            cx,
+        )
+        .await
     })
+}
+
+fn confirm_choice(
+    tx: &mut Option<oneshot::Sender<CompareChoice>>,
+    choice: CompareChoice,
+    cx: &mut Context<Picker<impl PickerDelegate>>,
+) {
+    if let Some(tx) = tx.take() {
+        tx.send(choice).ok();
+    }
+    cx.emit(DismissEvent);
+}
+
+struct HistoryPicker {
+    picker: Entity<Picker<HistoryPickerDelegate>>,
+    _subscription: Subscription,
+}
+
+impl HistoryPicker {
+    fn new(
+        repository: Entity<Repository>,
+        repo_path: RepoPath,
+        entries: Vec<FileRevisionEntry>,
+        tx: oneshot::Sender<CompareChoice>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let picker = cx.new(|cx| {
+            Picker::uniform_list(
+                HistoryPickerDelegate::new(repository, repo_path, entries, tx),
+                window,
+                cx,
+            )
+            .initial_width(rems(42.))
+        });
+        let _subscription = cx.subscribe(&picker, |_, _, _, cx| cx.emit(DismissEvent));
+        Self {
+            picker,
+            _subscription,
+        }
+    }
+}
+
+impl ModalView for HistoryPicker {}
+impl EventEmitter<DismissEvent> for HistoryPicker {}
+impl Focusable for HistoryPicker {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.picker.focus_handle(cx)
+    }
+}
+impl Render for HistoryPicker {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex().child(self.picker.clone()).on_mouse_down_out(
+            cx.listener(|this, _, window, cx| {
+                this.picker.update(cx, |this, cx| {
+                    this.cancel(&Default::default(), window, cx);
+                })
+            }),
+        )
+    }
+}
+
+#[derive(Clone)]
+enum HistoryCandidate {
+    Commit(FileRevisionEntry),
+    LoadMore,
+    Branches,
+    Stashes,
+}
+
+impl HistoryCandidate {
+    fn label(&self) -> String {
+        match self {
+            Self::Commit(entry) => {
+                format!(
+                    "{}  {}  {}  {}",
+                    entry.sha.chars().take(7).collect::<String>(),
+                    entry.subject,
+                    entry.author_name,
+                    entry.author_when
+                )
+            }
+            Self::LoadMore => "Load more…".into(),
+            Self::Branches => "Choose a Branch or Tag…".into(),
+            Self::Stashes => "Choose a Stash…".into(),
+        }
+    }
+}
+
+struct HistoryPickerDelegate {
+    repository: Entity<Repository>,
+    repo_path: RepoPath,
+    commits: Vec<FileRevisionEntry>,
+    has_more: bool,
+    candidates: Vec<HistoryCandidate>,
+    matches: Vec<StringMatch>,
+    selected_index: usize,
+    query: String,
+    tx: Option<oneshot::Sender<CompareChoice>>,
+}
+
+impl HistoryPickerDelegate {
+    fn new(
+        repository: Entity<Repository>,
+        repo_path: RepoPath,
+        entries: Vec<FileRevisionEntry>,
+        tx: oneshot::Sender<CompareChoice>,
+    ) -> Self {
+        let has_more = entries.len() == HISTORY_PAGE_SIZE;
+        Self {
+            repository,
+            repo_path,
+            commits: entries,
+            has_more,
+            candidates: Vec::new(),
+            matches: Vec::new(),
+            selected_index: 0,
+            query: String::new(),
+            tx: Some(tx),
+        }
+    }
+
+    fn rebuild_candidates(&self) -> Vec<HistoryCandidate> {
+        let mut candidates = vec![HistoryCandidate::Branches, HistoryCandidate::Stashes];
+        candidates.extend(self.commits.iter().cloned().map(HistoryCandidate::Commit));
+        if self.has_more {
+            candidates.push(HistoryCandidate::LoadMore);
+        }
+        candidates
+    }
+}
+
+impl PickerDelegate for HistoryPickerDelegate {
+    type ListItem = ListItem;
+
+    fn name() -> &'static str {
+        "compare file with revision"
+    }
+
+    fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
+        "Select a commit from this file's history…".into()
+    }
+
+    fn match_count(&self) -> usize {
+        self.matches.len()
+    }
+
+    fn selected_index(&self) -> usize {
+        self.selected_index
+    }
+
+    fn set_selected_index(
+        &mut self,
+        ix: usize,
+        _window: &mut Window,
+        _: &mut Context<Picker<Self>>,
+    ) {
+        self.selected_index = ix;
+    }
+
+    fn update_matches(
+        &mut self,
+        query: String,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Task<()> {
+        self.query = query.clone();
+        let candidates = self.rebuild_candidates();
+        cx.spawn_in(window, async move |picker, cx| {
+            let string_candidates = candidates
+                .iter()
+                .enumerate()
+                .map(|(index, candidate)| StringMatchCandidate::new(index, &candidate.label()))
+                .collect::<Vec<_>>();
+            let matches = if query.is_empty() {
+                string_candidates
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, candidate)| StringMatch {
+                        candidate_id: index,
+                        string: candidate.string,
+                        positions: Vec::new(),
+                        score: 0.0,
+                    })
+                    .collect()
+            } else {
+                fuzzy::match_strings(
+                    &string_candidates,
+                    &query,
+                    true,
+                    true,
+                    10000,
+                    &Default::default(),
+                    cx.background_executor().clone(),
+                )
+                .await
+            };
+            picker
+                .update(cx, |picker, _| {
+                    let delegate = &mut picker.delegate;
+                    delegate.candidates = candidates;
+                    delegate.matches = matches;
+                    delegate.selected_index = delegate
+                        .selected_index
+                        .min(delegate.matches.len().saturating_sub(1));
+                })
+                .log_err();
+        })
+    }
+
+    fn confirm(&mut self, _: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        let Some(hit) = self.matches.get(self.selected_index) else {
+            return;
+        };
+        let Some(candidate) = self.candidates.get(hit.candidate_id).cloned() else {
+            return;
+        };
+        match candidate {
+            HistoryCandidate::Commit(entry) => {
+                confirm_choice(&mut self.tx, CompareChoice::Revision(entry.sha), cx);
+            }
+            HistoryCandidate::Branches => {
+                confirm_choice(&mut self.tx, CompareChoice::Branches, cx);
+            }
+            HistoryCandidate::Stashes => {
+                confirm_choice(&mut self.tx, CompareChoice::Stashes, cx);
+            }
+            HistoryCandidate::LoadMore => {
+                let skip = self.commits.len();
+                let repository = self.repository.clone();
+                let repo_path = self.repo_path.clone();
+                cx.spawn_in(window, async move |picker, cx| {
+                    let more = repository
+                        .update(cx, |repository, _| {
+                            repository.log_for_path(repo_path, skip, HISTORY_PAGE_SIZE)
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or_default();
+                    picker
+                        .update_in(cx, |picker, window, cx| {
+                            let has_more = more.len() == HISTORY_PAGE_SIZE;
+                            picker.delegate.commits.extend(more);
+                            picker.delegate.has_more = has_more;
+                            let query = picker.delegate.query.clone();
+                            picker.delegate.update_matches(query, window, cx).detach();
+                        })
+                        .ok();
+                })
+                .detach();
+            }
+        }
+    }
+
+    fn dismissed(&mut self, _: &mut Window, cx: &mut Context<Picker<Self>>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn render_match(
+        &self,
+        ix: usize,
+        selected: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) -> Option<Self::ListItem> {
+        let hit = self.matches.get(ix)?;
+        Some(
+            ListItem::new(format!("history-picker-{ix}"))
+                .inset(true)
+                .spacing(ListItemSpacing::Sparse)
+                .toggle_state(selected)
+                .child(HighlightedLabel::new(
+                    hit.string.clone(),
+                    hit.positions.clone(),
+                )),
+        )
+    }
 }
 
 struct RevisionPicker {
@@ -178,7 +624,7 @@ impl RevisionPicker {
     fn new(
         branches: Arc<[Branch]>,
         tags: Vec<String>,
-        tx: oneshot::Sender<String>,
+        tx: oneshot::Sender<CompareChoice>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -196,22 +642,20 @@ impl RevisionPicker {
 
 impl ModalView for RevisionPicker {}
 impl EventEmitter<DismissEvent> for RevisionPicker {}
-
 impl Focusable for RevisionPicker {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.picker.focus_handle(cx)
     }
 }
-
 impl Render for RevisionPicker {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
-            .child(self.picker.clone())
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+        v_flex().child(self.picker.clone()).on_mouse_down_out(
+            cx.listener(|this, _, window, cx| {
                 this.picker.update(cx, |this, cx| {
                     this.cancel(&Default::default(), window, cx);
                 })
-            }))
+            }),
+        )
     }
 }
 
@@ -246,11 +690,11 @@ struct RevisionPickerDelegate {
     matches: Vec<StringMatch>,
     selected_index: usize,
     query: String,
-    tx: Option<oneshot::Sender<String>>,
+    tx: Option<oneshot::Sender<CompareChoice>>,
 }
 
 impl RevisionPickerDelegate {
-    fn new(branches: Arc<[Branch]>, tags: Vec<String>, tx: oneshot::Sender<String>) -> Self {
+    fn new(branches: Arc<[Branch]>, tags: Vec<String>, tx: oneshot::Sender<CompareChoice>) -> Self {
         let mut candidates = vec![RevisionCandidate::Head];
         for branch in branches.iter() {
             candidates.push(RevisionCandidate::Branch {
@@ -268,34 +712,17 @@ impl RevisionPickerDelegate {
             tx: Some(tx),
         }
     }
-
-    fn confirm_revision(&mut self, revision: String, cx: &mut Context<Picker<Self>>) {
-        let revision = revision.trim().to_string();
-        if revision.is_empty() {
-            return;
-        }
-        self.tx.take().map(|tx| tx.send(revision));
-        cx.emit(DismissEvent);
-    }
 }
 
 impl PickerDelegate for RevisionPickerDelegate {
     type ListItem = ListItem;
 
     fn name() -> &'static str {
-        "compare file with revision"
+        "compare file with branch or tag"
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         "Select a branch, tag, or type a revision (HEAD~3, SHA)…".into()
-    }
-
-    fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
-        if self.query.trim().is_empty() {
-            Some("No revisions".into())
-        } else {
-            Some("Press enter to use the typed revision".into())
-        }
     }
 
     fn match_count(&self) -> usize {
@@ -370,13 +797,9 @@ impl PickerDelegate for RevisionPickerDelegate {
                     let delegate = &mut picker.delegate;
                     delegate.candidates = candidates;
                     delegate.matches = matches;
-                    delegate.selected_index = if delegate.matches.is_empty() {
-                        0
-                    } else {
-                        delegate
-                            .selected_index
-                            .min(delegate.matches.len().saturating_sub(1))
-                    };
+                    delegate.selected_index = delegate
+                        .selected_index
+                        .min(delegate.matches.len().saturating_sub(1));
                 })
                 .log_err();
         })
@@ -386,14 +809,32 @@ impl PickerDelegate for RevisionPickerDelegate {
         if let Some(hit) = self.matches.get(self.selected_index)
             && let Some(candidate) = self.candidates.get(hit.candidate_id)
         {
-            self.confirm_revision(candidate.revision().to_string(), cx);
+            confirm_choice(
+                &mut self.tx,
+                CompareChoice::Revision(candidate.revision().to_string()),
+                cx,
+            );
             return;
         }
-        self.confirm_revision(self.query.clone(), cx);
+        let trimmed = self.query.trim();
+        if !trimmed.is_empty() {
+            confirm_choice(
+                &mut self.tx,
+                CompareChoice::Revision(trimmed.to_string()),
+                cx,
+            );
+        }
     }
 
     fn confirm_input(&mut self, _: bool, _window: &mut Window, cx: &mut Context<Picker<Self>>) {
-        self.confirm_revision(self.query.clone(), cx);
+        let trimmed = self.query.trim();
+        if !trimmed.is_empty() {
+            confirm_choice(
+                &mut self.tx,
+                CompareChoice::Revision(trimmed.to_string()),
+                cx,
+            );
+        }
     }
 
     fn dismissed(&mut self, _: &mut Window, cx: &mut Context<Picker<Self>>) {
@@ -421,11 +862,195 @@ impl PickerDelegate for RevisionPickerDelegate {
     }
 }
 
+struct StashRevisionPicker {
+    picker: Entity<Picker<StashRevisionDelegate>>,
+    _subscription: Subscription,
+}
+
+impl StashRevisionPicker {
+    fn new(
+        entries: Vec<StashEntry>,
+        tx: oneshot::Sender<CompareChoice>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let picker = cx.new(|cx| {
+            Picker::uniform_list(StashRevisionDelegate::new(entries, tx), window, cx)
+                .initial_width(rems(40.))
+        });
+        let _subscription = cx.subscribe(&picker, |_, _, _, cx| cx.emit(DismissEvent));
+        Self {
+            picker,
+            _subscription,
+        }
+    }
+}
+
+impl ModalView for StashRevisionPicker {}
+impl EventEmitter<DismissEvent> for StashRevisionPicker {}
+impl Focusable for StashRevisionPicker {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.picker.focus_handle(cx)
+    }
+}
+impl Render for StashRevisionPicker {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex().child(self.picker.clone()).on_mouse_down_out(
+            cx.listener(|this, _, window, cx| {
+                this.picker.update(cx, |this, cx| {
+                    this.cancel(&Default::default(), window, cx);
+                })
+            }),
+        )
+    }
+}
+
+struct StashRevisionDelegate {
+    entries: Vec<StashEntry>,
+    matches: Vec<StringMatch>,
+    selected_index: usize,
+    tx: Option<oneshot::Sender<CompareChoice>>,
+}
+
+impl StashRevisionDelegate {
+    fn new(entries: Vec<StashEntry>, tx: oneshot::Sender<CompareChoice>) -> Self {
+        Self {
+            entries,
+            matches: Vec::new(),
+            selected_index: 0,
+            tx: Some(tx),
+        }
+    }
+}
+
+impl PickerDelegate for StashRevisionDelegate {
+    type ListItem = ListItem;
+
+    fn name() -> &'static str {
+        "compare file with stash"
+    }
+
+    fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
+        "Select a stash that touches this file…".into()
+    }
+
+    fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
+        Some("No stashes touch this file".into())
+    }
+
+    fn match_count(&self) -> usize {
+        self.matches.len()
+    }
+
+    fn selected_index(&self) -> usize {
+        self.selected_index
+    }
+
+    fn set_selected_index(
+        &mut self,
+        ix: usize,
+        _window: &mut Window,
+        _: &mut Context<Picker<Self>>,
+    ) {
+        self.selected_index = ix;
+    }
+
+    fn update_matches(
+        &mut self,
+        query: String,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Task<()> {
+        let labels = self
+            .entries
+            .iter()
+            .map(|entry| format!("stash@{{{}}}  {}", entry.index, entry.message))
+            .collect::<Vec<_>>();
+        cx.spawn_in(window, async move |picker, cx| {
+            let string_candidates = labels
+                .iter()
+                .enumerate()
+                .map(|(index, label)| StringMatchCandidate::new(index, label))
+                .collect::<Vec<_>>();
+            let matches = if query.is_empty() {
+                string_candidates
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, candidate)| StringMatch {
+                        candidate_id: index,
+                        string: candidate.string,
+                        positions: Vec::new(),
+                        score: 0.0,
+                    })
+                    .collect()
+            } else {
+                fuzzy::match_strings(
+                    &string_candidates,
+                    &query,
+                    true,
+                    true,
+                    10000,
+                    &Default::default(),
+                    cx.background_executor().clone(),
+                )
+                .await
+            };
+            picker
+                .update(cx, |picker, _| {
+                    picker.delegate.matches = matches;
+                    picker.delegate.selected_index = picker
+                        .delegate
+                        .selected_index
+                        .min(picker.delegate.matches.len().saturating_sub(1));
+                })
+                .log_err();
+        })
+    }
+
+    fn confirm(&mut self, _: bool, _window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        if let Some(hit) = self.matches.get(self.selected_index)
+            && let Some(entry) = self.entries.get(hit.candidate_id)
+        {
+            confirm_choice(
+                &mut self.tx,
+                CompareChoice::Revision(format!("stash@{{{}}}", entry.index)),
+                cx,
+            );
+        }
+    }
+
+    fn dismissed(&mut self, _: &mut Window, cx: &mut Context<Picker<Self>>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn render_match(
+        &self,
+        ix: usize,
+        selected: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) -> Option<Self::ListItem> {
+        let hit = self.matches.get(ix)?;
+        Some(
+            ListItem::new(format!("stash-revision-{ix}"))
+                .inset(true)
+                .spacing(ListItemSpacing::Sparse)
+                .toggle_state(selected)
+                .child(HighlightedLabel::new(
+                    hit.string.clone(),
+                    hit.positions.clone(),
+                )),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use editor::SelectionEffects;
     use editor::test::editor_test_context::assert_state_with_diff;
     use git::repository::Branch;
+    use git::stash::GitStash;
     use gpui::{TestAppContext, VisualTestContext};
     use language::language_settings::AllLanguageSettings;
     use project::project_settings::ProjectSettings;
@@ -468,6 +1093,7 @@ mod tests {
                 ".git": {},
                 "file.txt": "working copy\n",
                 "later.txt": "added later\n",
+                "greeting.txt": "working greeting\n",
             }),
         )
         .await;
@@ -478,6 +1104,7 @@ mod tests {
             &[
                 ("file.txt", "at head\n".into()),
                 ("later.txt", "added later\n".into()),
+                ("greeting.txt", "at head greeting\n".into()),
             ],
             "sha-head",
         );
@@ -491,12 +1118,19 @@ mod tests {
         fs.set_ref_for_repo(dot_git, "refs/heads/feature", "sha-feature");
         fs.set_ref_for_repo(dot_git, "refs/remotes/origin/topic", "sha-feature");
         fs.set_ref_for_repo(dot_git, "refs/tags/v1.0", "sha-tag");
+        fs.set_ref_for_repo(dot_git, "refs/tags/before-rename", "sha-rename");
+        fs.push_commit_history_for_repo(
+            dot_git,
+            "sha-rename",
+            &[("hello.txt", "old name contents\n".into())],
+        );
         fs.push_commit_history_for_repo(dot_git, "sha-tag", &[("file.txt", "at tag\n".into())]);
         fs.push_commit_history_for_repo(
             dot_git,
             "sha-feature",
             &[("file.txt", "at feature\n".into())],
         );
+        fs.set_follow_aliases_for_repo(dot_git, "greeting.txt", &["greeting.txt", "hello.txt"]);
 
         let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
         cx.run_until_parked();
@@ -542,16 +1176,25 @@ mod tests {
         buffer.update(cx, |buffer, cx| {
             buffer.edit([(0..buffer.len(), "unsaved working copy\n")], None, cx);
         });
+        editor.update_in(cx, |editor, window, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([Point::new(0, 0)..Point::new(0, 0)]);
+            });
+        });
         let target = workspace
             .read_with(cx, |workspace, cx| compare_target(workspace, cx))
             .expect("file should belong to a repository");
 
-        for (revision, old_line) in [
-            ("feature", "at feature"),
-            ("v1.0", "at tag"),
-            ("sha-tag", "at tag"),
-            ("HEAD~1", "at feature"),
-            ("origin/topic", "at feature"),
+        for (revision, old_line, tab) in [
+            ("feature", "at feature", "file.txt (feature) ↔ file.txt"),
+            ("v1.0", "at tag", "file.txt (v1.0) ↔ file.txt"),
+            ("sha-tag", "at tag", "file.txt (sha-tag) ↔ file.txt"),
+            ("HEAD~1", "at feature", "file.txt (HEAD~1) ↔ file.txt"),
+            (
+                "origin/topic",
+                "at feature",
+                "file.txt (origin/topic) ↔ file.txt",
+            ),
         ] {
             let diff_view = workspace
                 .update_in(cx, |workspace, window, cx| {
@@ -567,6 +1210,9 @@ mod tests {
                 .unwrap();
             cx.run_until_parked();
 
+            diff_view.read_with(cx, |diff_view, cx| {
+                assert_eq!(diff_view.tab_content_text(0, cx), tab);
+            });
             assert_state_with_diff(
                 &diff_view.read_with(cx, |diff_view, cx| {
                     diff_view.editor().read(cx).rhs_editor().clone()
@@ -579,17 +1225,11 @@ mod tests {
                     "
                 )),
             );
-            diff_view.read_with(cx, |diff_view, cx| {
-                assert_eq!(
-                    diff_view.tab_content_text(0, cx),
-                    format!("file.txt @ {revision} ↔ file.txt")
-                );
-            });
         }
     }
 
     #[gpui::test]
-    async fn test_compare_file_missing_at_revision(cx: &mut TestAppContext) {
+    async fn test_compare_file_missing_at_revision_is_empty_left(cx: &mut TestAppContext) {
         init_test(cx);
         let (_fs, project) = setup_compare_repo(cx).await;
         let (multi_workspace, cx) =
@@ -601,17 +1241,122 @@ mod tests {
         let target = workspace
             .read_with(cx, |workspace, cx| compare_target(workspace, cx))
             .expect("file should belong to a repository");
-        let error = workspace
+        let diff_view = workspace
             .update_in(cx, |workspace, window, cx| {
                 open_file_diff_against_revision(target, "v1.0".into(), workspace, window, cx)
             })
             .await
-            .expect_err("later.txt should be absent at v1.0");
-        assert!(
-            error
-                .to_string()
-                .contains("does not exist at revision 'v1.0'"),
-            "unexpected error: {error:#}"
+            .unwrap();
+        cx.run_until_parked();
+        diff_view.read_with(cx, |diff_view, cx| {
+            assert_eq!(
+                diff_view.tab_content_text(0, cx),
+                "later.txt (not in v1.0) ↔ later.txt"
+            );
+        });
+        assert_state_with_diff(
+            &diff_view.read_with(cx, |diff_view, cx| {
+                diff_view.editor().read(cx).rhs_editor().clone()
+            }),
+            cx,
+            &unindent(
+                "
+                + ˇadded later
+                ",
+            ),
+        );
+    }
+
+    #[gpui::test]
+    async fn test_compare_follows_rename(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_fs, project) = setup_compare_repo(cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let editor = open_file_editor(&project, &workspace, "greeting.txt", cx).await;
+        cx.focus(&editor);
+
+        let target = workspace
+            .read_with(cx, |workspace, cx| compare_target(workspace, cx))
+            .expect("file should belong to a repository");
+        let diff_view = workspace
+            .update_in(cx, |workspace, window, cx| {
+                open_file_diff_against_revision(
+                    target,
+                    "before-rename".into(),
+                    workspace,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        assert_state_with_diff(
+            &diff_view.read_with(cx, |diff_view, cx| {
+                diff_view.editor().read(cx).rhs_editor().clone()
+            }),
+            cx,
+            &unindent(
+                "
+                - old name contents
+                + ˇworking greeting
+                ",
+            ),
+        );
+        diff_view.read_with(cx, |diff_view, cx| {
+            assert_eq!(
+                diff_view.tab_content_text(0, cx),
+                "hello.txt (before-rename) ↔ greeting.txt"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_compare_preserves_cursor(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_fs, project) = setup_compare_repo(cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let editor = open_file_editor(&project, &workspace, "file.txt", cx).await;
+        cx.focus(&editor);
+
+        let buffer = editor.read_with(cx, |editor, cx| editor.active_buffer(cx).unwrap());
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(0..buffer.len(), "line one\nline two\nline three\n")], None, cx);
+        });
+        editor.update_in(cx, |editor, window, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([Point::new(1, 5)..Point::new(1, 5)]);
+            });
+        });
+
+        let target = workspace
+            .read_with(cx, |workspace, cx| compare_target(workspace, cx))
+            .expect("file should belong to a repository");
+        assert_eq!(target.cursor, Point::new(1, 5));
+        let diff_view = workspace
+            .update_in(cx, |workspace, window, cx| {
+                open_file_diff_against_revision(target, "feature".into(), workspace, window, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        assert_state_with_diff(
+            &diff_view.read_with(cx, |diff_view, cx| {
+                diff_view.editor().read(cx).rhs_editor().clone()
+            }),
+            cx,
+            &unindent(
+                "
+                - at feature
+                + line one
+                + line ˇtwo
+                + line three
+                ",
+            ),
         );
     }
 
@@ -664,23 +1409,18 @@ mod tests {
         let editor = open_file_editor(&project, &workspace, "notes.txt", cx).await;
         cx.focus(&editor);
 
-        workspace.read_with(cx, |workspace, cx| {
-            assert!(compare_target(workspace, cx).is_none());
-            assert!(workspace.active_modal::<RevisionPicker>(cx).is_none());
-        });
-
         workspace.update_in(cx, |workspace, window, cx| {
             compare_file_with_revision(workspace, &git::CompareFileWithRevision, window, cx);
         });
         cx.run_until_parked();
         workspace.read_with(cx, |workspace, cx| {
-            assert!(workspace.active_modal::<RevisionPicker>(cx).is_none());
+            assert!(workspace.active_modal::<HistoryPicker>(cx).is_none());
             assert!(workspace.active_item_as::<FileDiffView>(cx).is_none());
         });
     }
 
     #[gpui::test]
-    async fn test_action_opens_revision_picker(cx: &mut TestAppContext) {
+    async fn test_action_opens_history_picker(cx: &mut TestAppContext) {
         init_test(cx);
         let (_fs, project) = setup_compare_repo(cx).await;
         let (multi_workspace, cx) =
@@ -696,10 +1436,80 @@ mod tests {
 
         workspace.read_with(cx, |workspace, cx| {
             assert!(
-                workspace.active_modal::<RevisionPicker>(cx).is_some(),
-                "action should open the revision picker for a file in a repository"
+                workspace.active_modal::<HistoryPicker>(cx).is_some(),
+                "default action should open the file-history picker"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_history_picker_lists_commits_and_switches(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_fs, project) = setup_compare_repo(cx).await;
+        let repository = project.read_with(cx, |project, cx| {
+            project.active_repository(cx).expect("repository")
+        });
+        let (tx, rx) = oneshot::channel();
+        let entries = repository
+            .update(cx, |repository, _| {
+                repository.log_for_path(RepoPath::new("file.txt").unwrap(), 0, HISTORY_PAGE_SIZE)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(entries.iter().any(|entry| entry.sha == "sha-feature"));
+
+        let window = cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+        let picker = window
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| {
+                    HistoryPicker::new(
+                        repository,
+                        RepoPath::new("file.txt").unwrap(),
+                        entries,
+                        tx,
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .unwrap();
+        picker
+            .update_in(cx, |picker, window, cx| {
+                picker.picker.update(cx, |picker, cx| {
+                    picker.delegate.update_matches(String::new(), window, cx)
+                })
+            })
+            .await;
+        cx.run_until_parked();
+        let labels = picker.read_with(cx, |picker, cx| {
+            picker
+                .picker
+                .read(cx)
+                .delegate
+                .matches
+                .iter()
+                .map(|hit| hit.string.clone())
+                .collect::<Vec<_>>()
+        });
+        assert!(labels.iter().any(|label| label.contains("sha-fea")));
+        assert!(labels.iter().any(|label| label.contains("Branch or Tag")));
+        assert!(labels.iter().any(|label| label.contains("Stash")));
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker.picker.update(cx, |picker, cx| {
+                let stash_ix = picker
+                    .delegate
+                    .matches
+                    .iter()
+                    .position(|hit| hit.string.contains("Stash"))
+                    .unwrap();
+                picker.delegate.selected_index = stash_ix;
+                picker.delegate.confirm(false, window, cx);
+            });
+        });
+        assert!(matches!(rx.await.unwrap(), CompareChoice::Stashes));
     }
 
     #[gpui::test]
@@ -724,12 +1534,6 @@ mod tests {
                         upstream: None,
                         most_recent_commit: None,
                     },
-                    Branch {
-                        is_head: false,
-                        ref_name: "refs/remotes/origin/topic".into(),
-                        upstream: None,
-                        most_recent_commit: None,
-                    },
                 ],
                 cx,
             );
@@ -741,12 +1545,7 @@ mod tests {
             .await
             .expect("tags job should complete")
             .expect("tags should load");
-        assert_eq!(tags, vec!["v1.0".to_string()]);
-
-        let window = cx.add_window(|window, cx| {
-            let workspace = Workspace::test_new(project.clone(), window, cx);
-            workspace
-        });
+        let window = cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
         let cx = &mut VisualTestContext::from_window(*window, cx);
         let picker = window
             .update(cx, |_, window, cx| {
@@ -761,31 +1560,6 @@ mod tests {
                 })
             })
             .unwrap();
-
-        picker
-            .update_in(cx, |picker, window, cx| {
-                picker.picker.update(cx, |picker, cx| {
-                    picker.delegate.update_matches(String::new(), window, cx)
-                })
-            })
-            .await;
-        cx.run_until_parked();
-
-        let labels = picker.read_with(cx, |picker, cx| {
-            picker
-                .picker
-                .read(cx)
-                .delegate
-                .matches
-                .iter()
-                .map(|hit| hit.string.clone())
-                .collect::<Vec<_>>()
-        });
-        assert!(labels.iter().any(|label| label == "HEAD"));
-        assert!(labels.iter().any(|label| label.contains("feature")));
-        assert!(labels.iter().any(|label| label.contains("origin/topic")));
-        assert!(labels.iter().any(|label| label.contains("v1.0")));
-
         picker
             .update_in(cx, |picker, window, cx| {
                 picker.picker.update(cx, |picker, cx| {
@@ -794,13 +1568,103 @@ mod tests {
             })
             .await;
         cx.run_until_parked();
-
         picker.update_in(cx, |picker, window, cx| {
             picker.picker.update(cx, |picker, cx| {
                 picker.delegate.confirm(false, window, cx);
             });
         });
-        assert_eq!(rx.await.unwrap(), "HEAD~3");
+        match rx.await.unwrap() {
+            CompareChoice::Revision(revision) => assert_eq!(revision, "HEAD~3"),
+            other => panic!("expected revision, got {other:?}"),
+        }
+    }
+
+    #[gpui::test]
+    async fn test_stash_picker_filters_to_file(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (fs, project) = setup_compare_repo(cx).await;
+        let dot_git = Path::new(path!("/project/.git"));
+        fs.push_commit_history_for_repo(
+            dot_git,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &[("file.txt", "stashed contents\n".into())],
+        );
+        fs.with_git_state(dot_git, true, |state| {
+            state.stash_entries = GitStash {
+                entries: vec![
+                    StashEntry {
+                        index: 0,
+                        oid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .parse()
+                            .unwrap(),
+                        message: "unrelated".into(),
+                        branch: None,
+                        timestamp: 0,
+                    },
+                    StashEntry {
+                        index: 1,
+                        oid: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            .parse()
+                            .unwrap(),
+                        message: "touches file".into(),
+                        branch: None,
+                        timestamp: 0,
+                    },
+                ]
+                .into(),
+            };
+        })
+        .unwrap();
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let editor = open_file_editor(&project, &workspace, "file.txt", cx).await;
+        cx.focus(&editor);
+
+        let repository = workspace
+            .read_with(cx, |workspace, cx| compare_target(workspace, cx))
+            .unwrap()
+            .repository;
+        let (tx, rx) = oneshot::channel();
+        let historical = [RepoPath::new("file.txt").unwrap()];
+        let stash_entries = repository.read_with(cx, |repository, _| {
+            repository.cached_stash().entries
+        });
+        let mut matching = Vec::new();
+        for entry in stash_entries.iter() {
+            let revision = format!("stash@{{{}}}", entry.index);
+            let paths = repository
+                .update(cx, |repository, _| repository.changed_paths_at(revision))
+                .await
+                .unwrap()
+                .unwrap();
+            if paths.iter().any(|path| historical.contains(path)) {
+                matching.push(entry.clone());
+            }
+        }
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].index, 1);
+
+        let picker = cx.new_window_entity(|window, cx| {
+            StashRevisionPicker::new(matching, tx, window, cx)
+        });
+        picker
+            .update_in(cx, |picker, window, cx| {
+                picker.picker.update(cx, |picker, cx| {
+                    picker.delegate.update_matches(String::new(), window, cx)
+                })
+            })
+            .await;
+        picker.update_in(cx, |picker, window, cx| {
+            picker.picker.update(cx, |picker, cx| {
+                picker.delegate.confirm(false, window, cx);
+            });
+        });
+        match rx.await.unwrap() {
+            CompareChoice::Revision(revision) => assert_eq!(revision, "stash@{1}"),
+            other => panic!("expected stash revision, got {other:?}"),
+        }
     }
 
     #[gpui::test]
