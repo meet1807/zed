@@ -503,7 +503,7 @@ impl GitRepository for FakeGitRepository {
     fn log_for_path(
         &self,
         path: RepoPath,
-        skip: usize,
+        before: Option<String>,
         limit: usize,
     ) -> BoxFuture<'_, Result<Vec<FileRevisionEntry>>> {
         self.with_state_async(false, move |state| {
@@ -523,10 +523,38 @@ impl GitRepository for FakeGitRepository {
                         subject: snapshot.sha.clone(),
                         author_name: "tester".into(),
                         author_when: "now".into(),
+                        follow_path: path.clone(),
                     });
                 }
             }
-            Ok(entries.into_iter().skip(skip).take(limit).collect())
+            if let Some(before) = before {
+                let start = entries
+                    .iter()
+                    .position(|entry| entry.sha == before)
+                    .map(|index| index + 1)
+                    .unwrap_or(entries.len());
+                entries = entries.into_iter().skip(start).take(limit).collect();
+            } else {
+                entries.truncate(limit);
+            }
+            Ok(entries)
+        })
+    }
+
+    fn stash_file_paths(&self) -> BoxFuture<'_, Result<Vec<(usize, Vec<RepoPath>)>>> {
+        self.with_state_async(false, |state| {
+            let mut listed = Vec::new();
+            for entry in state.stash_entries.entries.iter() {
+                let oid = entry.oid.to_string();
+                let paths = state
+                    .commit_history
+                    .iter()
+                    .find(|snapshot| snapshot.sha == oid)
+                    .map(|snapshot| snapshot.head_contents.keys().cloned().collect())
+                    .unwrap_or_default();
+                listed.push((entry.index, paths));
+            }
+            Ok(listed)
         })
     }
 

@@ -160,7 +160,7 @@ fn pick_history(
         let (tx, rx) = oneshot::channel();
         let entries = repository
             .update(cx, |repository, _| {
-                repository.log_for_path(repo_path.clone(), 0, HISTORY_PAGE_SIZE)
+                repository.log_for_path(repo_path.clone(), None, HISTORY_PAGE_SIZE)
             })
             .await
             .ok()
@@ -216,18 +216,22 @@ fn pick_stash(
             .ok()
             .and_then(Result::ok)
             .unwrap_or_default();
+        let stash_paths = repository
+            .update(cx, |repository, _| repository.stash_file_paths())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
         let stash_entries = repository.read_with(cx, |repository, _| {
             repository.cached_stash().entries
         });
         let mut matching = Vec::new();
         for entry in stash_entries.iter() {
-            let revision = format!("stash@{{{}}}", entry.index);
-            let paths = repository
-                .update(cx, |repository, _| repository.changed_paths_at(revision))
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .unwrap_or_default();
+            let paths = stash_paths
+                .iter()
+                .find(|(index, _)| *index == entry.index)
+                .map(|(_, paths)| paths.as_slice())
+                .unwrap_or(&[]);
             if paths.iter().any(|path| historical.contains(path)) {
                 matching.push(entry.clone());
             }
@@ -563,13 +567,17 @@ impl PickerDelegate for HistoryPickerDelegate {
                 confirm_choice(&mut self.tx, CompareChoice::Stashes, cx);
             }
             HistoryCandidate::LoadMore => {
-                let skip = self.commits.len();
+                let before = self.commits.last().map(|entry| entry.sha.clone());
+                let path = self
+                    .commits
+                    .last()
+                    .map(|entry| entry.follow_path.clone())
+                    .unwrap_or_else(|| self.repo_path.clone());
                 let repository = self.repository.clone();
-                let repo_path = self.repo_path.clone();
                 cx.spawn_in(window, async move |picker, cx| {
                     let more = repository
                         .update(cx, |repository, _| {
-                            repository.log_for_path(repo_path, skip, HISTORY_PAGE_SIZE)
+                            repository.log_for_path(path, before, HISTORY_PAGE_SIZE)
                         })
                         .await
                         .ok()
@@ -1452,7 +1460,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let entries = repository
             .update(cx, |repository, _| {
-                repository.log_for_path(RepoPath::new("file.txt").unwrap(), 0, HISTORY_PAGE_SIZE)
+                repository.log_for_path(RepoPath::new("file.txt").unwrap(), None, HISTORY_PAGE_SIZE)
             })
             .await
             .unwrap()
@@ -1628,17 +1636,21 @@ mod tests {
             .repository;
         let (tx, rx) = oneshot::channel();
         let historical = [RepoPath::new("file.txt").unwrap()];
+        let stash_paths = repository
+            .update(cx, |repository, _| repository.stash_file_paths())
+            .await
+            .unwrap()
+            .unwrap();
         let stash_entries = repository.read_with(cx, |repository, _| {
             repository.cached_stash().entries
         });
         let mut matching = Vec::new();
         for entry in stash_entries.iter() {
-            let revision = format!("stash@{{{}}}", entry.index);
-            let paths = repository
-                .update(cx, |repository, _| repository.changed_paths_at(revision))
-                .await
-                .unwrap()
-                .unwrap();
+            let paths = stash_paths
+                .iter()
+                .find(|(index, _)| *index == entry.index)
+                .map(|(_, paths)| paths.as_slice())
+                .unwrap_or(&[]);
             if paths.iter().any(|path| historical.contains(path)) {
                 matching.push(entry.clone());
             }

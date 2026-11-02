@@ -9190,13 +9190,26 @@ impl Repository {
     pub fn log_for_path(
         &mut self,
         path: RepoPath,
-        skip: usize,
+        before: Option<String>,
         limit: usize,
     ) -> oneshot::Receiver<Result<Vec<FileRevisionEntry>>> {
         self.send_job("log_for_path", None, move |repo, _| async move {
             match repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
-                    backend.log_for_path(path, skip, limit).await
+                    backend.log_for_path(path, before, limit).await
+                }
+                RepositoryState::Remote(_) => Ok(Vec::new()),
+            }
+        })
+    }
+
+    pub fn stash_file_paths(
+        &mut self,
+    ) -> oneshot::Receiver<Result<Vec<(usize, Vec<RepoPath>)>>> {
+        self.send_job("stash_file_paths", None, move |repo, _| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.stash_file_paths().await
                 }
                 RepositoryState::Remote(_) => Ok(Vec::new()),
             }

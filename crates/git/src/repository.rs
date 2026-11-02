@@ -534,6 +534,9 @@ pub struct FileRevisionEntry {
     pub subject: String,
     pub author_name: String,
     pub author_when: String,
+    /// Path to pass when asking for history older than this commit.
+    /// A rename stores the previous name so paging can keep following it.
+    pub follow_path: RepoPath,
 }
 
 #[derive(Debug)]
@@ -868,9 +871,15 @@ pub trait GitRepository: Send + Sync {
     fn log_for_path(
         &self,
         _path: RepoPath,
-        _skip: usize,
+        _before: Option<String>,
         _limit: usize,
     ) -> BoxFuture<'_, Result<Vec<FileRevisionEntry>>> {
+        async { Ok(Vec::new()) }.boxed()
+    }
+
+    /// Files touched by each stash, one entry per stash index.
+    /// One git invocation, so a long stash list does not spawn a process per stash.
+    fn stash_file_paths(&self) -> BoxFuture<'_, Result<Vec<(usize, Vec<RepoPath>)>>> {
         async { Ok(Vec::new()) }.boxed()
     }
 
@@ -1416,6 +1425,148 @@ fn parse_remote_urls(stdout: &str) -> HashMap<String, String> {
         }
     }
     urls
+}
+
+fn parse_file_revision_log(stdout: &str, fallback_path: &RepoPath) -> Vec<FileRevisionEntry> {
+    let mut entries = Vec::new();
+    for chunk in stdout.split('\u{1e}') {
+        let mut lines = chunk.lines().filter(|line| !line.is_empty());
+        let Some(header) = lines.next() else {
+            continue;
+        };
+        let mut fields = header.split('\u{1f}');
+        let (Some(sha), Some(subject), Some(author_name), Some(author_when)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            continue;
+        };
+        let mut follow_path = fallback_path.clone();
+        if let Some(status_line) = lines.next() {
+            let mut parts = status_line.split('\t');
+            let status = parts.next().unwrap_or("");
+            if status.starts_with('R') || status.starts_with('C') {
+                if let Some(old_path) = parts.next().filter(|path| !path.is_empty())
+                    && let Ok(path) = RepoPath::new(old_path)
+                {
+                    follow_path = path;
+                }
+            } else if let Some(path) = parts.next().filter(|path| !path.is_empty())
+                && let Ok(path) = RepoPath::new(path)
+            {
+                follow_path = path;
+            }
+        }
+        entries.push(FileRevisionEntry {
+            sha: sha.to_string(),
+            subject: subject.to_string(),
+            author_name: author_name.to_string(),
+            author_when: author_when.to_string(),
+            follow_path,
+        });
+    }
+    entries
+}
+
+struct StashFileList {
+    index: usize,
+    paths: Vec<RepoPath>,
+    /// Third parent of a stash commit. Its tree is the untracked files.
+    untracked_parent: Option<String>,
+}
+
+fn parse_stash_file_paths(stdout: &str) -> Vec<StashFileList> {
+    let mut listed = Vec::new();
+    for chunk in stdout.split('\u{1e}') {
+        let mut lines = chunk.lines().filter(|line| !line.is_empty());
+        let Some(header) = lines.next() else {
+            continue;
+        };
+        let (label, parents) = header.split_once('\u{1f}').unwrap_or((header, ""));
+        let Some(index_str) = label
+            .trim()
+            .strip_prefix("stash@{")
+            .and_then(|rest| rest.strip_suffix('}'))
+        else {
+            continue;
+        };
+        let Ok(index) = index_str.parse::<usize>() else {
+            continue;
+        };
+        let untracked_parent = parents.split_whitespace().nth(2).map(str::to_string);
+        let paths = lines
+            .filter_map(|line| RepoPath::new(line.trim()).ok())
+            .collect();
+        listed.push(StashFileList {
+            index,
+            paths,
+            untracked_parent,
+        });
+    }
+    listed
+}
+
+async fn untracked_paths_by_parent(
+    git: &GitBinary,
+    parents: &[String],
+) -> Result<HashMap<String, Vec<RepoPath>>> {
+    let mut process = git
+        .build_command(&[
+            "diff-tree",
+            "-r",
+            "--name-only",
+            "--root",
+            "-z",
+            "--stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = BufWriter::new(process.stdin.take().context("no stdin")?);
+    for parent in parents {
+        stdin.write_all(parent.as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+    }
+    stdin.flush().await?;
+    drop(stdin);
+    let output = process.output().await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "'git diff-tree' failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(parse_diff_tree_paths(&output.stdout, parents))
+}
+
+fn parse_diff_tree_paths(stdout: &[u8], parents: &[String]) -> HashMap<String, Vec<RepoPath>> {
+    let parent_set = parents
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut paths_by_parent: HashMap<String, Vec<RepoPath>> = HashMap::default();
+    let mut current = None;
+    for part in stdout.split(|byte| *byte == 0) {
+        if part.is_empty() {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(part) else {
+            continue;
+        };
+        if parent_set.contains(text) {
+            current = Some(text.to_string());
+        } else if let Some(parent) = current.as_ref()
+            && let Ok(path) = RepoPath::new(text)
+        {
+            paths_by_parent
+                .entry(parent.clone())
+                .or_default()
+                .push(path);
+        }
+    }
+    paths_by_parent
 }
 
 impl GitRepository for RealGitRepository {
@@ -2218,42 +2369,97 @@ impl GitRepository for RealGitRepository {
     fn log_for_path(
         &self,
         path: RepoPath,
-        skip: usize,
+        before: Option<String>,
         limit: usize,
     ) -> BoxFuture<'_, Result<Vec<FileRevisionEntry>>> {
         let git = self.git_binary();
         self.executor
             .spawn(async move {
-                let skip_arg = format!("--skip={skip}");
+                if limit == 0 {
+                    return Ok(Vec::new());
+                }
+                // `--skip` with `--follow` stops returning commits once the
+                // walk crosses a rename. Start at `before^` instead, and use
+                // the pre-image path recorded on the previous page.
                 let limit_arg = format!("--max-count={limit}");
+                let before_spec = before.as_ref().map(|sha| format!("{sha}^"));
+                let mut args = vec![
+                    "log",
+                    "--follow",
+                    "--name-status",
+                    "--pretty=format:%x1e%H%x1f%s%x1f%an%x1f%ar",
+                    limit_arg.as_str(),
+                ];
+                if let Some(before_spec) = before_spec.as_deref() {
+                    args.push(before_spec);
+                }
+                args.push("--");
+                args.push(path.as_unix_str());
+                let output = git.build_command(&args).output().await?;
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if before.is_some()
+                        && (stderr.contains("bad revision")
+                            || stderr.contains("unknown revision")
+                            || stderr.contains("Needed a single revision"))
+                    {
+                        return Ok(Vec::new());
+                    }
+                    anyhow::bail!("'git log --follow' failed: {stderr}");
+                }
+                Ok(parse_file_revision_log(
+                    &String::from_utf8_lossy(&output.stdout),
+                    &path,
+                ))
+            })
+            .boxed()
+    }
+
+    fn stash_file_paths(&self) -> BoxFuture<'_, Result<Vec<(usize, Vec<RepoPath>)>>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
                 let output = git
                     .build_command(&[
                         "log",
-                        "--follow",
-                        "--format=%H%x00%s%x00%an%x00%ar",
-                        &skip_arg,
-                        &limit_arg,
-                        "--",
-                        path.as_unix_str(),
+                        "-g",
+                        "--first-parent",
+                        "--name-only",
+                        "--pretty=format:%x1e%gd%x1f%P",
+                        "refs/stash",
                     ])
                     .output()
                     .await?;
-                anyhow::ensure!(
-                    output.status.success(),
-                    "'git log --follow' failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                Ok(String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .filter_map(|line| {
-                        let mut fields = line.split('\0');
-                        Some(FileRevisionEntry {
-                            sha: fields.next()?.to_string(),
-                            subject: fields.next()?.to_string(),
-                            author_name: fields.next()?.to_string(),
-                            author_when: fields.next()?.to_string(),
-                        })
-                    })
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if stderr.contains("unknown revision")
+                        || stderr.contains("bad revision")
+                        || stderr.contains("does not have any commits")
+                    {
+                        return Ok(Vec::new());
+                    }
+                    anyhow::bail!("'git log -g refs/stash' failed: {stderr}");
+                }
+                let mut listed =
+                    parse_stash_file_paths(&String::from_utf8_lossy(&output.stdout));
+                let untracked_parents = listed
+                    .iter()
+                    .filter_map(|entry| entry.untracked_parent.clone())
+                    .collect::<Vec<_>>();
+                if !untracked_parents.is_empty() {
+                    let untracked = untracked_paths_by_parent(&git, &untracked_parents).await?;
+                    for entry in &mut listed {
+                        let Some(parent) = entry.untracked_parent.as_ref() else {
+                            continue;
+                        };
+                        if let Some(paths) = untracked.get(parent) {
+                            entry.paths.extend(paths.iter().cloned());
+                        }
+                    }
+                }
+                Ok(listed
+                    .into_iter()
+                    .map(|entry| (entry.index, entry.paths))
                     .collect())
             })
             .boxed()
@@ -4555,6 +4761,133 @@ mod tests {
             fs::canonicalize(left.as_ref()).unwrap(),
             fs::canonicalize(right.as_ref()).unwrap()
         );
+    }
+
+    #[test]
+    fn test_parse_file_revision_log_keeps_rename_preimage() {
+        let fallback = repo_path("new.txt");
+        let stdout = "\u{1e}abc\u{1f}rename\u{1f}Ada\u{1f}2 days ago\nR099\told.txt\tnew.txt\n\n\u{1e}def\u{1f}edit\u{1f}Ada\u{1f}3 days ago\nM\told.txt\n";
+        let entries = parse_file_revision_log(stdout, &fallback);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sha, "abc");
+        assert_eq!(entries[0].subject, "rename");
+        assert_eq!(entries[0].follow_path.as_unix_str(), "old.txt");
+        assert_eq!(entries[1].follow_path.as_unix_str(), "old.txt");
+    }
+
+    #[test]
+    fn test_parse_stash_file_paths_reads_indexes() {
+        let stdout = "\u{1e}stash@{0}\u{1f}aaa bbb\nnew.txt\n\n\u{1e}stash@{1}\u{1f}ccc ddd eee\n";
+        let listed = parse_stash_file_paths(stdout);
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].index, 0);
+        assert_eq!(listed[0].paths[0].as_unix_str(), "new.txt");
+        assert!(listed[0].untracked_parent.is_none());
+        assert_eq!(listed[1].index, 1);
+        assert!(listed[1].paths.is_empty());
+        assert_eq!(listed[1].untracked_parent.as_deref(), Some("eee"));
+    }
+
+    #[test]
+    fn test_parse_diff_tree_paths_groups_by_parent() {
+        let parents = vec!["aaa".to_string(), "bbb".to_string()];
+        let stdout = b"aaa\0notes.tmp\0bbb\0other.tmp\0extra.tmp\0";
+        let paths = parse_diff_tree_paths(stdout, &parents);
+        assert_eq!(paths["aaa"][0].as_unix_str(), "notes.tmp");
+        assert_eq!(paths["bbb"][0].as_unix_str(), "other.tmp");
+        assert_eq!(paths["bbb"][1].as_unix_str(), "extra.tmp");
+    }
+
+    #[gpui::test]
+    async fn test_log_for_path_pages_across_rename(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        fs::write(repo_dir.path().join("old.txt"), "one\n").unwrap();
+        git_command(repo_dir.path(), ["add", "old.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "add old"]);
+        fs::write(repo_dir.path().join("old.txt"), "two\n").unwrap();
+        git_command(repo_dir.path(), ["add", "old.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "edit old"]);
+        git_command(repo_dir.path(), ["mv", "old.txt", "new.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "rename"]);
+        fs::write(repo_dir.path().join("new.txt"), "three\n").unwrap();
+        git_command(repo_dir.path(), ["add", "new.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "edit new"]);
+
+        let repository = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        let empty_stashes = repository.stash_file_paths().await.unwrap();
+        assert!(empty_stashes.is_empty());
+
+        fs::write(repo_dir.path().join("notes.tmp"), "note\n").unwrap();
+        git_command(
+            repo_dir.path(),
+            ["stash", "push", "-u", "-m", "untracked", "--", "notes.tmp"],
+        );
+        fs::write(repo_dir.path().join("new.txt"), "stashed\n").unwrap();
+        git_command(
+            repo_dir.path(),
+            ["stash", "push", "-m", "touches file", "--", "new.txt"],
+        );
+
+        let first_page = repository
+            .log_for_path(repo_path("new.txt"), None, 2)
+            .await
+            .unwrap();
+        assert_eq!(first_page.len(), 2);
+        assert_eq!(first_page[0].subject, "edit new");
+        assert_eq!(first_page[1].subject, "rename");
+        assert_eq!(first_page[1].follow_path.as_unix_str(), "old.txt");
+
+        let older = repository
+            .log_for_path(
+                first_page[1].follow_path.clone(),
+                Some(first_page[1].sha.clone()),
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            older
+                .iter()
+                .map(|entry| entry.subject.as_str())
+                .collect::<Vec<_>>(),
+            vec!["edit old", "add old"]
+        );
+        assert!(
+            older
+                .iter()
+                .all(|entry| entry.follow_path.as_unix_str() == "old.txt")
+        );
+
+        let done = repository
+            .log_for_path(older[1].follow_path.clone(), Some(older[1].sha.clone()), 2)
+            .await
+            .unwrap();
+        assert!(done.is_empty());
+
+        let stashes = repository.stash_file_paths().await.unwrap();
+        let touching_new = stashes
+            .iter()
+            .filter(|(_, paths)| paths.iter().any(|path| path.as_unix_str() == "new.txt"))
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>();
+        let touching_notes = stashes
+            .iter()
+            .filter(|(_, paths)| paths.iter().any(|path| path.as_unix_str() == "notes.tmp"))
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>();
+        assert_eq!(touching_new, vec![0]);
+        assert_eq!(touching_notes, vec![1]);
     }
 
     #[gpui::test]
