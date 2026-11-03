@@ -159,9 +159,7 @@ fn pick_history(
     cx.spawn(async move |cx| {
         let (tx, rx) = oneshot::channel();
         let entries = repository
-            .update(cx, |repository, _| {
-                repository.log_for_path(repo_path.clone(), None, HISTORY_PAGE_SIZE)
-            })
+            .update(cx, |repository, _| repository.log_for_path(repo_path))
             .await
             .ok()
             .and_then(Result::ok)
@@ -169,7 +167,7 @@ fn pick_history(
         workspace
             .update_in(cx, |workspace, window, cx| {
                 workspace.toggle_modal(window, cx, |window, cx| {
-                    HistoryPicker::new(repository, repo_path, entries, tx, window, cx)
+                    HistoryPicker::new(entries, tx, window, cx)
                 });
             })
             .ok()?;
@@ -359,20 +357,14 @@ struct HistoryPicker {
 
 impl HistoryPicker {
     fn new(
-        repository: Entity<Repository>,
-        repo_path: RepoPath,
         entries: Vec<FileRevisionEntry>,
         tx: oneshot::Sender<CompareChoice>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let picker = cx.new(|cx| {
-            Picker::uniform_list(
-                HistoryPickerDelegate::new(repository, repo_path, entries, tx),
-                window,
-                cx,
-            )
-            .initial_width(rems(42.))
+            Picker::uniform_list(HistoryPickerDelegate::new(entries, tx), window, cx)
+                .initial_width(rems(42.))
         });
         let _subscription = cx.subscribe(&picker, |_, _, _, cx| cx.emit(DismissEvent));
         Self {
@@ -429,10 +421,8 @@ impl HistoryCandidate {
 }
 
 struct HistoryPickerDelegate {
-    repository: Entity<Repository>,
-    repo_path: RepoPath,
     commits: Vec<FileRevisionEntry>,
-    has_more: bool,
+    shown: usize,
     candidates: Vec<HistoryCandidate>,
     matches: Vec<StringMatch>,
     selected_index: usize,
@@ -441,18 +431,11 @@ struct HistoryPickerDelegate {
 }
 
 impl HistoryPickerDelegate {
-    fn new(
-        repository: Entity<Repository>,
-        repo_path: RepoPath,
-        entries: Vec<FileRevisionEntry>,
-        tx: oneshot::Sender<CompareChoice>,
-    ) -> Self {
-        let has_more = entries.len() == HISTORY_PAGE_SIZE;
+    fn new(entries: Vec<FileRevisionEntry>, tx: oneshot::Sender<CompareChoice>) -> Self {
+        let shown = entries.len().min(HISTORY_PAGE_SIZE);
         Self {
-            repository,
-            repo_path,
             commits: entries,
-            has_more,
+            shown,
             candidates: Vec::new(),
             matches: Vec::new(),
             selected_index: 0,
@@ -463,8 +446,14 @@ impl HistoryPickerDelegate {
 
     fn rebuild_candidates(&self) -> Vec<HistoryCandidate> {
         let mut candidates = vec![HistoryCandidate::Branches, HistoryCandidate::Stashes];
-        candidates.extend(self.commits.iter().cloned().map(HistoryCandidate::Commit));
-        if self.has_more {
+        candidates.extend(
+            self.commits
+                .iter()
+                .take(self.shown)
+                .cloned()
+                .map(HistoryCandidate::Commit),
+        );
+        if self.shown < self.commits.len() {
             candidates.push(HistoryCandidate::LoadMore);
         }
         candidates
@@ -567,33 +556,9 @@ impl PickerDelegate for HistoryPickerDelegate {
                 confirm_choice(&mut self.tx, CompareChoice::Stashes, cx);
             }
             HistoryCandidate::LoadMore => {
-                let before = self.commits.last().map(|entry| entry.sha.clone());
-                let path = self
-                    .commits
-                    .last()
-                    .map(|entry| entry.follow_path.clone())
-                    .unwrap_or_else(|| self.repo_path.clone());
-                let repository = self.repository.clone();
-                cx.spawn_in(window, async move |picker, cx| {
-                    let more = repository
-                        .update(cx, |repository, _| {
-                            repository.log_for_path(path, before, HISTORY_PAGE_SIZE)
-                        })
-                        .await
-                        .ok()
-                        .and_then(Result::ok)
-                        .unwrap_or_default();
-                    picker
-                        .update_in(cx, |picker, window, cx| {
-                            let has_more = more.len() == HISTORY_PAGE_SIZE;
-                            picker.delegate.commits.extend(more);
-                            picker.delegate.has_more = has_more;
-                            let query = picker.delegate.query.clone();
-                            picker.delegate.update_matches(query, window, cx).detach();
-                        })
-                        .ok();
-                })
-                .detach();
+                self.shown = self.commits.len().min(self.shown + HISTORY_PAGE_SIZE);
+                let query = self.query.clone();
+                self.update_matches(query, window, cx).detach();
             }
         }
     }
@@ -1460,7 +1425,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let entries = repository
             .update(cx, |repository, _| {
-                repository.log_for_path(RepoPath::new("file.txt").unwrap(), None, HISTORY_PAGE_SIZE)
+                repository.log_for_path(RepoPath::new("file.txt").unwrap())
             })
             .await
             .unwrap()
@@ -1471,16 +1436,7 @@ mod tests {
         let cx = &mut VisualTestContext::from_window(*window, cx);
         let picker = window
             .update(cx, |_, window, cx| {
-                cx.new(|cx| {
-                    HistoryPicker::new(
-                        repository,
-                        RepoPath::new("file.txt").unwrap(),
-                        entries,
-                        tx,
-                        window,
-                        cx,
-                    )
-                })
+                cx.new(|cx| HistoryPicker::new(entries, tx, window, cx))
             })
             .unwrap();
         picker

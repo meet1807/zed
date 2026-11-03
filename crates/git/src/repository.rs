@@ -534,9 +534,6 @@ pub struct FileRevisionEntry {
     pub subject: String,
     pub author_name: String,
     pub author_when: String,
-    /// Path to pass when asking for history older than this commit.
-    /// A rename stores the previous name so paging can keep following it.
-    pub follow_path: RepoPath,
 }
 
 #[derive(Debug)]
@@ -868,27 +865,18 @@ pub trait GitRepository: Send + Sync {
         async { Ok(Vec::new()) }.boxed()
     }
 
-    fn log_for_path(
-        &self,
-        _path: RepoPath,
-        _before: Option<String>,
-        _limit: usize,
-    ) -> BoxFuture<'_, Result<Vec<FileRevisionEntry>>> {
+    fn log_for_path(&self, _path: RepoPath) -> BoxFuture<'_, Result<Vec<FileRevisionEntry>>> {
         async { Ok(Vec::new()) }.boxed()
     }
 
     /// Files touched by each stash, one entry per stash index.
-    /// One git invocation, so a long stash list does not spawn a process per stash.
+    /// One reflog walk, plus one diff-tree when a stash has untracked files.
     fn stash_file_paths(&self) -> BoxFuture<'_, Result<Vec<(usize, Vec<RepoPath>)>>> {
         async { Ok(Vec::new()) }.boxed()
     }
 
     fn historical_paths(&self, path: RepoPath) -> BoxFuture<'_, Result<Vec<RepoPath>>> {
         async move { Ok(vec![path]) }.boxed()
-    }
-
-    fn changed_paths_at(&self, _revision: String) -> BoxFuture<'_, Result<Vec<RepoPath>>> {
-        async { Ok(Vec::new()) }.boxed()
     }
 
     fn change_branch(&self, name: String) -> BoxFuture<'_, Result<()>>;
@@ -1427,11 +1415,10 @@ fn parse_remote_urls(stdout: &str) -> HashMap<String, String> {
     urls
 }
 
-fn parse_file_revision_log(stdout: &str, fallback_path: &RepoPath) -> Vec<FileRevisionEntry> {
+fn parse_file_revision_log(stdout: &str) -> Vec<FileRevisionEntry> {
     let mut entries = Vec::new();
     for chunk in stdout.split('\u{1e}') {
-        let mut lines = chunk.lines().filter(|line| !line.is_empty());
-        let Some(header) = lines.next() else {
+        let Some(header) = chunk.lines().find(|line| !line.is_empty()) else {
             continue;
         };
         let mut fields = header.split('\u{1f}');
@@ -1443,28 +1430,11 @@ fn parse_file_revision_log(stdout: &str, fallback_path: &RepoPath) -> Vec<FileRe
         ) else {
             continue;
         };
-        let mut follow_path = fallback_path.clone();
-        if let Some(status_line) = lines.next() {
-            let mut parts = status_line.split('\t');
-            let status = parts.next().unwrap_or("");
-            if status.starts_with('R') || status.starts_with('C') {
-                if let Some(old_path) = parts.next().filter(|path| !path.is_empty())
-                    && let Ok(path) = RepoPath::new(old_path)
-                {
-                    follow_path = path;
-                }
-            } else if let Some(path) = parts.next().filter(|path| !path.is_empty())
-                && let Ok(path) = RepoPath::new(path)
-            {
-                follow_path = path;
-            }
-        }
         entries.push(FileRevisionEntry {
             sha: sha.to_string(),
             subject: subject.to_string(),
             author_name: author_name.to_string(),
             author_when: author_when.to_string(),
-            follow_path,
         });
     }
     entries
@@ -2366,51 +2336,31 @@ impl GitRepository for RealGitRepository {
             .boxed()
     }
 
-    fn log_for_path(
-        &self,
-        path: RepoPath,
-        before: Option<String>,
-        limit: usize,
-    ) -> BoxFuture<'_, Result<Vec<FileRevisionEntry>>> {
+    fn log_for_path(&self, path: RepoPath) -> BoxFuture<'_, Result<Vec<FileRevisionEntry>>> {
         let git = self.git_binary();
         self.executor
             .spawn(async move {
-                if limit == 0 {
-                    return Ok(Vec::new());
-                }
-                // `--skip` with `--follow` stops returning commits once the
-                // walk crosses a rename. Start at `before^` instead, and use
-                // the pre-image path recorded on the previous page.
-                let limit_arg = format!("--max-count={limit}");
-                let before_spec = before.as_ref().map(|sha| format!("{sha}^"));
-                let mut args = vec![
-                    "log",
-                    "--follow",
-                    "--name-status",
-                    "--pretty=format:%x1e%H%x1f%s%x1f%an%x1f%ar",
-                    limit_arg.as_str(),
-                ];
-                if let Some(before_spec) = before_spec.as_deref() {
-                    args.push(before_spec);
-                }
-                args.push("--");
-                args.push(path.as_unix_str());
-                let output = git.build_command(&args).output().await?;
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    if before.is_some()
-                        && (stderr.contains("bad revision")
-                            || stderr.contains("unknown revision")
-                            || stderr.contains("Needed a single revision"))
-                    {
-                        return Ok(Vec::new());
-                    }
-                    anyhow::bail!("'git log --follow' failed: {stderr}");
-                }
-                Ok(parse_file_revision_log(
-                    &String::from_utf8_lossy(&output.stdout),
-                    &path,
-                ))
+                // One walk. `--max-count` plus `<commit>^` drops commits that
+                // are not first-parent ancestors of the page boundary, and
+                // `--skip` with `--follow` stops at a rename.
+                let output = git
+                    .build_command(&[
+                        "log",
+                        "--follow",
+                        "--pretty=format:%x1e%H%x1f%s%x1f%an%x1f%ar",
+                        "--",
+                        path.as_unix_str(),
+                    ])
+                    .output()
+                    .await?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "'git log --follow' failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                Ok(parse_file_revision_log(&String::from_utf8_lossy(
+                    &output.stdout,
+                )))
             })
             .boxed()
     }
@@ -2419,6 +2369,18 @@ impl GitRepository for RealGitRepository {
         let git = self.git_binary();
         self.executor
             .spawn(async move {
+                let verify = git
+                    .build_command(&["rev-parse", "--verify", "--quiet", "refs/stash"])
+                    .output()
+                    .await?;
+                if verify.status.code() == Some(1) {
+                    return Ok(Vec::new());
+                }
+                anyhow::ensure!(
+                    verify.status.success(),
+                    "'git rev-parse refs/stash' failed: {}",
+                    String::from_utf8_lossy(&verify.stderr)
+                );
                 let output = git
                     .build_command(&[
                         "log",
@@ -2430,16 +2392,11 @@ impl GitRepository for RealGitRepository {
                     ])
                     .output()
                     .await?;
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    if stderr.contains("unknown revision")
-                        || stderr.contains("bad revision")
-                        || stderr.contains("does not have any commits")
-                    {
-                        return Ok(Vec::new());
-                    }
-                    anyhow::bail!("'git log -g refs/stash' failed: {stderr}");
-                }
+                anyhow::ensure!(
+                    output.status.success(),
+                    "'git log -g refs/stash' failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
                 let mut listed =
                     parse_stash_file_paths(&String::from_utf8_lossy(&output.stdout));
                 let untracked_parents = listed
@@ -2499,63 +2456,6 @@ impl GitRepository for RealGitRepository {
                     }
                 }
                 Ok(paths)
-            })
-            .boxed()
-    }
-
-    fn changed_paths_at(&self, revision: String) -> BoxFuture<'_, Result<Vec<RepoPath>>> {
-        let git = self.git_binary();
-        self.executor
-            .spawn(async move {
-                let parse_paths = |stdout: &[u8]| {
-                    String::from_utf8_lossy(stdout)
-                        .lines()
-                        .filter_map(|line| RepoPath::new(line.trim()).ok())
-                        .collect::<Vec<_>>()
-                };
-                if revision.starts_with("stash@{") {
-                    let with_untracked = git
-                        .build_command(&[
-                            "stash",
-                            "show",
-                            "--name-only",
-                            "--include-untracked",
-                            "--",
-                            &revision,
-                        ])
-                        .output()
-                        .await?;
-                    if with_untracked.status.success() {
-                        return Ok(parse_paths(&with_untracked.stdout));
-                    }
-                    let tracked = git
-                        .build_command(&["stash", "show", "--name-only", "--", &revision])
-                        .output()
-                        .await?;
-                    anyhow::ensure!(
-                        tracked.status.success(),
-                        "'git stash show' failed: {}",
-                        String::from_utf8_lossy(&tracked.stderr)
-                    );
-                    return Ok(parse_paths(&tracked.stdout));
-                }
-                let output = git
-                    .build_command(&[
-                        "diff-tree",
-                        "--no-commit-id",
-                        "--name-only",
-                        "-r",
-                        &revision,
-                        "--",
-                    ])
-                    .output()
-                    .await?;
-                anyhow::ensure!(
-                    output.status.success(),
-                    "'git diff-tree' failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                Ok(parse_paths(&output.stdout))
             })
             .boxed()
     }
@@ -4764,15 +4664,15 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_file_revision_log_keeps_rename_preimage() {
-        let fallback = repo_path("new.txt");
-        let stdout = "\u{1e}abc\u{1f}rename\u{1f}Ada\u{1f}2 days ago\nR099\told.txt\tnew.txt\n\n\u{1e}def\u{1f}edit\u{1f}Ada\u{1f}3 days ago\nM\told.txt\n";
-        let entries = parse_file_revision_log(stdout, &fallback);
+    fn test_parse_file_revision_log() {
+        let stdout = "\u{1e}abc\u{1f}rename\u{1f}Ada\u{1f}2 days ago\n\n\u{1e}def\u{1f}edit\u{1f}Ada\u{1f}3 days ago\n";
+        let entries = parse_file_revision_log(stdout);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].sha, "abc");
         assert_eq!(entries[0].subject, "rename");
-        assert_eq!(entries[0].follow_path.as_unix_str(), "old.txt");
-        assert_eq!(entries[1].follow_path.as_unix_str(), "old.txt");
+        assert_eq!(entries[0].author_name, "Ada");
+        assert_eq!(entries[1].sha, "def");
+        assert_eq!(entries[1].subject, "edit");
     }
 
     #[test]
@@ -4799,7 +4699,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_log_for_path_pages_across_rename(cx: &mut TestAppContext) {
+    async fn test_log_for_path_follows_rename_and_lists_stash_files(cx: &mut TestAppContext) {
         disable_git_global_config();
         cx.executor().allow_parking();
 
@@ -4839,41 +4739,25 @@ mod tests {
             ["stash", "push", "-m", "touches file", "--", "new.txt"],
         );
 
-        let first_page = repository
-            .log_for_path(repo_path("new.txt"), None, 2)
-            .await
-            .unwrap();
-        assert_eq!(first_page.len(), 2);
-        assert_eq!(first_page[0].subject, "edit new");
-        assert_eq!(first_page[1].subject, "rename");
-        assert_eq!(first_page[1].follow_path.as_unix_str(), "old.txt");
-
-        let older = repository
-            .log_for_path(
-                first_page[1].follow_path.clone(),
-                Some(first_page[1].sha.clone()),
-                2,
-            )
-            .await
-            .unwrap();
+        let history = repository.log_for_path(repo_path("new.txt")).await.unwrap();
         assert_eq!(
-            older
+            history
                 .iter()
                 .map(|entry| entry.subject.as_str())
                 .collect::<Vec<_>>(),
-            vec!["edit old", "add old"]
+            vec!["edit new", "rename", "edit old", "add old"]
         );
-        assert!(
-            older
+        let reference = git_command_output(
+            repo_dir.path(),
+            ["log", "--follow", "--format=%H", "--", "new.txt"],
+        );
+        assert_eq!(
+            history
                 .iter()
-                .all(|entry| entry.follow_path.as_unix_str() == "old.txt")
+                .map(|entry| entry.sha.as_str())
+                .collect::<Vec<_>>(),
+            reference.lines().collect::<Vec<_>>()
         );
-
-        let done = repository
-            .log_for_path(older[1].follow_path.clone(), Some(older[1].sha.clone()), 2)
-            .await
-            .unwrap();
-        assert!(done.is_empty());
 
         let stashes = repository.stash_file_paths().await.unwrap();
         let touching_new = stashes
@@ -4888,6 +4772,55 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(touching_new, vec![0]);
         assert_eq!(touching_notes, vec![1]);
+    }
+
+    #[gpui::test]
+    async fn test_log_for_path_matches_follow_across_merge(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        fs::write(repo_dir.path().join("file.txt"), "a\nb\nc\n").unwrap();
+        git_command(repo_dir.path(), ["add", "file.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "base"]);
+        git_command(repo_dir.path(), ["branch", "side"]);
+        fs::write(repo_dir.path().join("file.txt"), "a\nb\nMAIN\n").unwrap();
+        git_command(repo_dir.path(), ["add", "file.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "main edit"]);
+        git_command(repo_dir.path(), ["checkout", "side"]);
+        fs::write(repo_dir.path().join("file.txt"), "SIDE\nb\nc\n").unwrap();
+        git_command(repo_dir.path(), ["add", "file.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "side edit"]);
+        git_command(repo_dir.path(), ["checkout", "main"]);
+        git_command(repo_dir.path(), ["merge", "-m", "merge", "side"]);
+
+        let repository = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        let history = repository.log_for_path(repo_path("file.txt")).await.unwrap();
+        let reference = git_command_output(
+            repo_dir.path(),
+            ["log", "--follow", "--format=%H", "--", "file.txt"],
+        );
+        assert_eq!(
+            history
+                .iter()
+                .map(|entry| entry.sha.as_str())
+                .collect::<Vec<_>>(),
+            reference.lines().collect::<Vec<_>>()
+        );
+        let subjects = history
+            .iter()
+            .map(|entry| entry.subject.as_str())
+            .collect::<Vec<_>>();
+        assert!(subjects.contains(&"side edit"));
+        assert!(subjects.contains(&"main edit"));
+        assert!(subjects.contains(&"base"));
     }
 
     #[gpui::test]

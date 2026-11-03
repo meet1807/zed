@@ -9190,13 +9190,11 @@ impl Repository {
     pub fn log_for_path(
         &mut self,
         path: RepoPath,
-        before: Option<String>,
-        limit: usize,
     ) -> oneshot::Receiver<Result<Vec<FileRevisionEntry>>> {
         self.send_job("log_for_path", None, move |repo, _| async move {
             match repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
-                    backend.log_for_path(path, before, limit).await
+                    backend.log_for_path(path).await
                 }
                 RepositoryState::Remote(_) => Ok(Vec::new()),
             }
@@ -9226,20 +9224,6 @@ impl Repository {
                     backend.historical_paths(path).await
                 }
                 RepositoryState::Remote(_) => Ok(vec![path]),
-            }
-        })
-    }
-
-    pub fn changed_paths_at(
-        &mut self,
-        revision: String,
-    ) -> oneshot::Receiver<Result<Vec<RepoPath>>> {
-        self.send_job("changed_paths_at", None, move |repo, _| async move {
-            match repo {
-                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
-                    backend.changed_paths_at(revision).await
-                }
-                RepositoryState::Remote(_) => Ok(Vec::new()),
             }
         })
     }

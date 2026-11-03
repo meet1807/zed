@@ -500,12 +500,7 @@ impl GitRepository for FakeGitRepository {
         })
     }
 
-    fn log_for_path(
-        &self,
-        path: RepoPath,
-        before: Option<String>,
-        limit: usize,
-    ) -> BoxFuture<'_, Result<Vec<FileRevisionEntry>>> {
+    fn log_for_path(&self, path: RepoPath) -> BoxFuture<'_, Result<Vec<FileRevisionEntry>>> {
         self.with_state_async(false, move |state| {
             let aliases = state
                 .follow_aliases
@@ -523,19 +518,8 @@ impl GitRepository for FakeGitRepository {
                         subject: snapshot.sha.clone(),
                         author_name: "tester".into(),
                         author_when: "now".into(),
-                        follow_path: path.clone(),
                     });
                 }
-            }
-            if let Some(before) = before {
-                let start = entries
-                    .iter()
-                    .position(|entry| entry.sha == before)
-                    .map(|index| index + 1)
-                    .unwrap_or(entries.len());
-                entries = entries.into_iter().skip(start).take(limit).collect();
-            } else {
-                entries.truncate(limit);
             }
             Ok(entries)
         })
@@ -565,38 +549,6 @@ impl GitRepository for FakeGitRepository {
                 .get(&path)
                 .cloned()
                 .unwrap_or_else(|| vec![path]))
-        })
-    }
-
-    fn changed_paths_at(&self, revision: String) -> BoxFuture<'_, Result<Vec<RepoPath>>> {
-        self.with_state_async(false, move |state| {
-            if let Some(rest) = revision.strip_prefix("stash@{")
-                && let Some(index_str) = rest.strip_suffix('}')
-                && let Ok(index) = index_str.parse::<usize>()
-                && let Some(entry) = state
-                    .stash_entries
-                    .entries
-                    .iter()
-                    .find(|entry| entry.index == index)
-            {
-                let oid = entry.oid.to_string();
-                if let Some(snapshot) = state
-                    .commit_history
-                    .iter()
-                    .find(|snapshot| snapshot.sha == oid)
-                {
-                    return Ok(snapshot.head_contents.keys().cloned().collect());
-                }
-            }
-            if let Some(sha) = resolve_revision(state, &revision)
-                && let Some(snapshot) = state
-                    .commit_history
-                    .iter()
-                    .find(|snapshot| snapshot.sha == sha)
-            {
-                return Ok(snapshot.head_contents.keys().cloned().collect());
-            }
-            Ok(Vec::new())
         })
     }
 
