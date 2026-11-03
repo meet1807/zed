@@ -40,7 +40,8 @@ use git::{
     repository::{
         Branch, BranchesScanResult, CommitData, CommitDetails, CommitFileStatus, CommitOptions,
         CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions, FileHistoryChangedFileSets,
-        GitCommitTemplate, GitRepository, InitialGraphCommitData, LogOrder, LogSource, PushOptions,
+        FileRevisionEntry, GitCommitTemplate, GitRepository, InitialGraphCommitData, LogOrder,
+        LogSource, PushOptions,
         Remote, RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs, UpstreamTrackingStatus,
         Worktree as GitWorktree, delete_branch_flag, is_binary_content,
     },
@@ -9175,6 +9176,58 @@ impl Repository {
         })
     }
 
+    pub fn tags(&mut self) -> oneshot::Receiver<Result<Vec<String>>> {
+        self.send_job("tags", None, move |repo, _| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.tags().await
+                }
+                RepositoryState::Remote(_) => Ok(Vec::new()),
+            }
+        })
+    }
+
+    pub fn log_for_path(
+        &mut self,
+        path: RepoPath,
+    ) -> oneshot::Receiver<Result<Vec<FileRevisionEntry>>> {
+        self.send_job("log_for_path", None, move |repo, _| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.log_for_path(path).await
+                }
+                RepositoryState::Remote(_) => Ok(Vec::new()),
+            }
+        })
+    }
+
+    pub fn stash_file_paths(
+        &mut self,
+    ) -> oneshot::Receiver<Result<Vec<(usize, Vec<RepoPath>)>>> {
+        self.send_job("stash_file_paths", None, move |repo, _| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.stash_file_paths().await
+                }
+                RepositoryState::Remote(_) => Ok(Vec::new()),
+            }
+        })
+    }
+
+    pub fn historical_paths(
+        &mut self,
+        path: RepoPath,
+    ) -> oneshot::Receiver<Result<Vec<RepoPath>>> {
+        self.send_job("historical_paths", None, move |repo, _| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.historical_paths(path).await
+                }
+                RepositoryState::Remote(_) => Ok(vec![path]),
+            }
+        })
+    }
+
     pub fn branches(&mut self) -> oneshot::Receiver<Result<BranchesScanResult>> {
         let id = self.id;
         self.send_job("branches", None, move |repo, _| async move {
@@ -10227,6 +10280,62 @@ impl Repository {
                         .await?;
                     Ok(response.staged_text)
                 }
+            }
+        });
+        cx.spawn(|_: &mut AsyncApp| async move { rx.await? })
+    }
+
+    pub fn load_text_at_revision(
+        &mut self,
+        path: RepoPath,
+        revision: String,
+        cx: &App,
+    ) -> Task<Result<Option<String>>> {
+        let task = self.load_file_at_revision(path, revision, false, cx);
+        cx.spawn(|_: &mut AsyncApp| async move {
+            Ok(task.await?.map(|(_, content)| content))
+        })
+    }
+
+    pub fn load_file_at_revision(
+        &mut self,
+        path: RepoPath,
+        revision: String,
+        follow_renames: bool,
+        cx: &App,
+    ) -> Task<Result<Option<(RepoPath, String)>>> {
+        if revision.contains('\n') || revision.contains(':') {
+            return Task::ready(Err(anyhow!(
+                "invalid revision {revision:?}: revisions cannot contain ':' or newlines"
+            )));
+        }
+        let rx = self.send_job("load_file_at_revision", None, move |state, _| async move {
+            match state {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    let mut paths = vec![path.clone()];
+                    if follow_renames {
+                        let historical = backend.historical_paths(path.clone()).await?;
+                        for historical_path in historical {
+                            if !paths.contains(&historical_path) {
+                                paths.push(historical_path);
+                            }
+                        }
+                    }
+                    let specs = paths
+                        .iter()
+                        .map(|candidate| format!("{revision}:{}", candidate.as_unix_str()))
+                        .collect::<Vec<_>>();
+                    let contents = backend.load_revisions(specs).await?;
+                    for (candidate, content) in paths.into_iter().zip(contents) {
+                        if let Some(bytes) = content {
+                            return Ok(Some((candidate, decode_git_text(bytes)?)));
+                        }
+                    }
+                    Ok(None)
+                }
+                RepositoryState::Remote(_) => Err(anyhow!(
+                    "Compare file with revision is not supported for remote projects"
+                )),
             }
         });
         cx.spawn(|_: &mut AsyncApp| async move { rx.await? })

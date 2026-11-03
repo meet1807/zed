@@ -604,24 +604,89 @@ pub fn init(cx: &mut App) {
                 return div;
             }
             let workspace = workspace.weak_handle();
-            div.capture_action(move |_: &git::FileHistory, window, cx| {
-                workspace
-                    .update(cx, |workspace, cx| {
-                        let Some(panel) = workspace.panel::<ProjectPanel>(cx) else {
-                            return;
-                        };
-                        let Some(project_path) = panel.read(cx).selected_entry_project_path(cx)
-                        else {
-                            return;
-                        };
-                        git_ui_core::open_file_history(workspace, &project_path, window, cx);
-                    })
-                    .log_err();
+            div.capture_action({
+                let workspace = workspace.clone();
+                move |_: &git::FileHistory, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            let Some(panel) = workspace.panel::<ProjectPanel>(cx) else {
+                                return;
+                            };
+                            let Some(project_path) = panel.read(cx).selected_entry_project_path(cx)
+                            else {
+                                return;
+                            };
+                            git_ui_core::open_file_history(workspace, &project_path, window, cx);
+                        })
+                        .log_err();
+                    cx.stop_propagation();
+                }
+            })
+            .capture_action({
+                let workspace = workspace.clone();
+                move |_: &git::CompareFileWithRevision, window, cx| {
+                    open_selected_then_compare(
+                        workspace.clone(),
+                        CompareDispatch::Revision,
+                        window,
+                        cx,
+                    );
+                    cx.stop_propagation();
+                }
+            })
+            .capture_action(move |_: &git::CompareFileWithBranchOrTag, window, cx| {
+                open_selected_then_compare(
+                    workspace.clone(),
+                    CompareDispatch::BranchOrTag,
+                    window,
+                    cx,
+                );
                 cx.stop_propagation();
             })
         });
     })
     .detach();
+}
+
+enum CompareDispatch {
+    Revision,
+    BranchOrTag,
+}
+
+fn open_selected_then_compare(
+    workspace: WeakEntity<Workspace>,
+    kind: CompareDispatch,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(project_path) = workspace
+        .update(cx, |workspace, cx| {
+            workspace
+                .panel::<ProjectPanel>(cx)
+                .and_then(|panel| panel.read(cx).selected_entry_project_path(cx))
+        })
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    window
+        .spawn(cx, async move |cx| {
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.open_path(project_path, None, true, window, cx)
+                })?
+                .await?;
+            workspace.update_in(cx, |_, window, cx| {
+                let action: Box<dyn gpui::Action> = match kind {
+                    CompareDispatch::Revision => git::CompareFileWithRevision.boxed_clone(),
+                    CompareDispatch::BranchOrTag => git::CompareFileWithBranchOrTag.boxed_clone(),
+                };
+                window.dispatch_action(action, cx);
+            })?;
+            anyhow::Ok(())
+        })
+        .detach();
 }
 
 #[derive(Debug)]
@@ -1268,6 +1333,16 @@ impl ProjectPanel {
                                     )
                                     .when(has_history, |menu| {
                                         menu.action("View History", Box::new(git::FileHistory))
+                                    })
+                                    .when(!is_dir && has_history, |menu| {
+                                        menu.action(
+                                            "Compare with Revision",
+                                            Box::new(git::CompareFileWithRevision),
+                                        )
+                                        .action(
+                                            "Compare with Branch or Tag",
+                                            Box::new(git::CompareFileWithBranchOrTag),
+                                        )
                                     })
                                     .when(!is_dir, |menu| {
                                         menu.action(

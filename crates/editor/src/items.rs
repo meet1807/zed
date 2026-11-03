@@ -1257,6 +1257,23 @@ impl Item for Editor {
             ));
         }
 
+        if self
+            .buffer()
+            .read(cx)
+            .as_singleton()
+            .and_then(|buffer| buffer.read(cx).file())
+            .is_some()
+        {
+            actions.push((
+                "Compare with Revision".into(),
+                Box::new(git::CompareFileWithRevision) as Box<dyn gpui::Action>,
+            ));
+            actions.push((
+                "Compare with Branch or Tag".into(),
+                Box::new(git::CompareFileWithBranchOrTag) as Box<dyn gpui::Action>,
+            ));
+        }
+
         actions
     }
 

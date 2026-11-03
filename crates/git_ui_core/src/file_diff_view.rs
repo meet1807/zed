@@ -8,8 +8,8 @@ use editor::{
 };
 use futures::{FutureExt, select_biased};
 use gpui::{
-    App, AppContext as _, AsyncApp, Context, Empty, Entity, EventEmitter, FocusHandle, Focusable,
-    Font, IntoElement, Render, Task, WeakEntity, Window,
+    App, AppContext as _, AsyncApp, AsyncWindowContext, Context, Empty, Entity, EventEmitter,
+    FocusHandle, Focusable, Font, IntoElement, Render, Task, WeakEntity, Window,
 };
 use language::{Buffer, HighlightedText, Point};
 use project::{Project, ProjectPath};
@@ -100,6 +100,68 @@ impl FileDiffView {
                 diff_view
             })
         })
+    }
+
+    pub fn open_from_buffers(
+        old_buffer: Entity<Buffer>,
+        new_buffer: Entity<Buffer>,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Entity<Self>>> {
+        window.spawn(cx, async move |cx| {
+            Self::open_from_buffers_in(old_buffer, new_buffer, None, workspace, cx).await
+        })
+    }
+
+    pub async fn open_from_buffers_in(
+        old_buffer: Entity<Buffer>,
+        new_buffer: Entity<Buffer>,
+        target_position: Option<Point>,
+        workspace: WeakEntity<Workspace>,
+        cx: &mut AsyncWindowContext,
+    ) -> Result<Entity<Self>> {
+        let project = workspace.update(cx, |workspace, _| workspace.project().clone())?;
+        let buffer_diff = build_buffer_diff(&old_buffer, &new_buffer, cx).await?;
+        workspace.update_in(cx, |workspace, window, cx| {
+            let workspace_entity = cx.entity();
+            let diff_view = cx.new(|cx| {
+                FileDiffView::new(
+                    old_buffer,
+                    new_buffer,
+                    buffer_diff,
+                    project.clone(),
+                    workspace_entity,
+                    window,
+                    cx,
+                )
+            });
+            let pane = workspace.active_pane();
+            pane.update(cx, |pane, cx| {
+                pane.add_item(Box::new(diff_view.clone()), true, true, None, window, cx);
+            });
+            if let Some(target_position) = target_position {
+                let (new_buffer, rhs_editor) = {
+                    let diff_view = diff_view.read(cx);
+                    (
+                        diff_view.new_buffer.clone(),
+                        diff_view.editor.read(cx).rhs_editor().clone(),
+                    )
+                };
+                let point = new_buffer
+                    .read(cx)
+                    .snapshot()
+                    .point_from_external_input(target_position.row, target_position.column);
+                rhs_editor.update(cx, |editor, cx| {
+                    editor.go_to_singleton_buffer_point(point, window, cx);
+                });
+            }
+            diff_view
+        })
+    }
+
+    pub fn editor(&self) -> &Entity<SplittableEditor> {
+        &self.editor
     }
 
     pub fn new(
@@ -272,14 +334,7 @@ impl Item for FileDiffView {
             buffer
                 .read(cx)
                 .file()
-                .and_then(|file| {
-                    Some(
-                        file.full_path(cx)
-                            .file_name()?
-                            .to_string_lossy()
-                            .to_string(),
-                    )
-                })
+                .map(|file| file.file_name(cx).to_string())
                 .unwrap_or_else(|| MultiBuffer::DEFAULT_TITLE.into())
         };
         let old_filename = title_text(&self.old_buffer);

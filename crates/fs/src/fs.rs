@@ -53,11 +53,11 @@ use text::LineEnding;
 #[cfg(feature = "test-support")]
 mod fake_git_repo;
 #[cfg(feature = "test-support")]
-use collections::{BTreeMap, btree_map};
+use collections::{BTreeMap, HashMap, btree_map};
 #[cfg(feature = "test-support")]
 pub use fake_git_repo::FakeBlobReadGate;
 #[cfg(feature = "test-support")]
-use fake_git_repo::{FakeCommitDataEntry, FakeGitRepositoryState};
+use fake_git_repo::{FakeCommitDataEntry, FakeCommitSnapshot, FakeGitRepositoryState};
 #[cfg(feature = "test-support")]
 use git::{
     repository::{CommitData, InitialGraphCommitData, RepoPath, Worktree, repo_path},
@@ -2539,6 +2539,53 @@ impl FakeFs {
         self.with_git_state(dot_git, true, |state| {
             state.blames.clear();
             state.blames.extend(blames);
+        })
+        .unwrap();
+    }
+
+    pub fn set_ref_for_repo(
+        &self,
+        dot_git: &Path,
+        ref_name: impl Into<String>,
+        sha: impl Into<String>,
+    ) {
+        self.with_git_state(dot_git, true, |state| {
+            state.refs.insert(ref_name.into(), sha.into());
+        })
+        .unwrap();
+    }
+
+    pub fn set_follow_aliases_for_repo(
+        &self,
+        dot_git: &Path,
+        path: &str,
+        aliases: &[&str],
+    ) {
+        self.with_git_state(dot_git, true, |state| {
+            state.follow_aliases.insert(
+                repo_path(path),
+                aliases.iter().map(|alias| repo_path(alias)).collect(),
+            );
+        })
+        .unwrap();
+    }
+
+    pub fn push_commit_history_for_repo(
+        &self,
+        dot_git: &Path,
+        sha: impl Into<String>,
+        contents: &[(&str, String)],
+    ) {
+        self.with_git_state(dot_git, true, |state| {
+            let head_contents: HashMap<RepoPath, Vec<u8>> = contents
+                .iter()
+                .map(|(path, content)| (repo_path(path), content.as_bytes().to_vec()))
+                .collect();
+            state.commit_history.push(FakeCommitSnapshot {
+                head_contents: head_contents.clone(),
+                index_contents: head_contents,
+                sha: sha.into(),
+            });
         })
         .unwrap();
     }
